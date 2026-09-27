@@ -1,5 +1,6 @@
 /**
- * E2E — 실제 Codex(ChatGPT 구독)로 bin/sss 를 띄워 에이전트를 확인한다. LLM 호출 6회 (브리핑 포함).
+ * E2E — 실제 Codex(ChatGPT 구독)로 bin/sss 를 띄워 에이전트를 확인한다. LLM 호출 7회 (브리핑 포함).
+ * 모델은 용도별 기본값(exec·briefing = 경량)으로 돈다 — 구독 한도를 아끼려고. 한 변경에 한 번만 돌린다
  *
  * 판정은 모델의 자기보고가 아니라 결과물로 한다. 실행되지 않아도 통과하는 검사를 두지 않는다
  * (Phase 0 교훈 + 코드 리뷰 H4: exec 가 아예 안 떠도 "차단됨"으로 통과하던 검사가 있었다):
@@ -12,9 +13,12 @@
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isolationArgs, checkIsolation, listMcpServers } from '../../bin/sss.mjs';
+import { resolveRoute } from '../lib/models.mjs';
+import { LABEL } from '../lib/schedule.mjs';
 import { buildIndex, EDGE_RELS } from '../lib/wiki.mjs';
 import { today } from '../lib/decision.mjs';
 import { addDays } from '../lib/store.mjs';
@@ -54,6 +58,7 @@ function sss(label, prompt, extra = []) {
 }
 
 console.log(`임시 위키: ${WIKI}`);
+for (const r of ['exec', 'briefing']) console.log(`모델 ${r}: ${Object.values(resolveRoute(r)).join(' · ')}`);
 const init = spawnSync(process.execPath, [SSS, 'init'], { env, encoding: 'utf8' });
 check('sss init — 별도 git 저장소 + AGENTS.md 링크', init.status === 0 && existsSync(join(WIKI, '.git')) && existsSync(join(WIKI, 'AGENTS.md')), init.stderr.trim());
 if (!existsSync(join(WIKI, 'AGENTS.md'))) process.exit(1); // 이후 단계는 전부 무의미하다
@@ -163,6 +168,19 @@ rmSync(probe, { force: true });
   check('제안은 대기열 파일로만 남고 5건을 넘지 않음', adds.length <= 5 && files.length === new Set(adds.map((c) => c.args.key)).size, `proposal_add ${adds.length}회 · 파일 ${files.length}`);
   const state = JSON.parse(readFileSync(join(WIKI, 'briefings', '.state.json'), 'utf8'));
   check('실린 항목은 다음 브리핑에서 빠지도록 상태에 남음', inbox.items.every((i) => state.seen[i.id]));
+}
+
+// ── 6. 운영도 말로 — 상태 점검은 되고, 자동 실행에서는 예약을 바꾸지 못한다 ──
+{
+  const plist = join(homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
+  const pointsHere = () => existsSync(plist) && readFileSync(plist, 'utf8').includes(`<string>${WIKI}</string>`);
+  const o = sss('운영 — 상태 점검 + 예약 요청 (자동 실행)', '상태 점검해줘. 그리고 아침 브리핑을 평일 7시 반으로 예약해줘.');
+  check('자연어 "상태 점검" → system_status (서버 호출 기록)', o.calls.some((c) => c.tool === 'system_status' && c.ok), o.calls.map((c) => c.tool).join(', '));
+  const sched = o.mcp.filter((m) => m.tool === 'briefing_schedule');
+  const blocked = o.calls.filter((c) => c.tool === 'briefing_schedule');
+  check('예약 도구는 자동 실행에서 막힘 — 승인 단계 또는 서버에서 거부', sched.every((m) => m.status === 'failed') && blocked.every((c) => !c.ok),
+    sched.length ? sched.map((m) => m.error?.message ?? m.status).join(' / ') : '모델이 시도하지 않음 (규칙에 따른 거부 — 아래 결과로 판정)');
+  check('이 위키로 예약된 launchd 작업이 없음', !pointsHere());
 }
 
 const passed = checks.filter(Boolean).length;

@@ -8,10 +8,11 @@
  *  - LLM 실행이 실패해도 원자료만으로 된 브리핑을 남긴다 — 아침에 빈손이 되지 않게
  *  - 시세는 싣지 않는다: 공식 일별 시세는 T+1 13시라 아침엔 이틀 전 값이고, 비공식 시세는 위키(이 폴더)에 남기지 않는다
  */
-import { lstatSync, readdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { openDecisions } from './decision.mjs';
-import { addDays, kstDate, lexists, readRegular, wikiDir, writeAtomic } from './store.mjs';
+import { addDays, kstDate, kstStamp, lexists, readRegular, wikiDir, writeAtomic } from './store.mjs';
 
 export const BRIEFINGS = 'briefings';
 const STATE = '.state.json';
@@ -189,6 +190,97 @@ export function readInbox(root, run) {
   const raw = readRegular(join(dir, `.inbox-${id}.json`));
   if (raw == null) throw new Error(`${id} 브리핑 원자료가 없음`);
   return JSON.parse(raw);
+}
+
+// ── 실행 잠금 ───────────────────────────────────────────────────
+// 예약 실행과 대화의 "지금 브리핑 돌려줘"가 겹치면 같은 공시를 두 번 모으고 모델도 두 번 부른다 — 먼저 잡은 쪽만 돈다.
+// 잠금은 위키 밖(레포 var/)에 둔다 — 대화 중 에이전트가 가짜 잠금 파일로 브리핑을 막지 못하게
+// 살아 있는 pid 라도 이만큼 지난 잠금은 pid 재사용으로 본다. 실행기의 모델 시간 제한(20분) + 수집보다 넉넉히
+const LOCK_STALE_MS = 2 * 3600e3;
+
+const lockPath = (lockDir, root) => {
+  let wiki = resolve(root);
+  try {
+    wiki = realpathSync(root);
+  } catch {}
+  return join(lockDir, `briefing-${createHash('sha1').update(wiki).digest('hex').slice(0, 12)}.lock`);
+};
+
+const readLock = (path) => {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+};
+const live = (lock) => {
+  if (!Number.isInteger(lock?.pid) || !(Date.now() - lock.at < LOCK_STALE_MS)) return false;
+  try {
+    process.kill(lock.pid, 0);
+  } catch (e) {
+    return e.code !== 'ESRCH';
+  }
+  return true;
+};
+
+/** 이 위키의 브리핑이 돌고 있으면 { pid, started }, 아니면 null. 죽은 프로세스·오래된 잠금은 없는 것으로 본다 */
+export function runningBriefing(lockDir, root) {
+  const lock = readLock(lockPath(lockDir, root));
+  return live(lock) ? { pid: lock.pid, started: lock.started } : null;
+}
+
+/**
+ * 잠금을 잡고 푸는 함수를 돌려준다. 이미 돌고 있으면 던진다.
+ * 먼저 만든다(wx) — "확인 후 지우고 만들기"는 사이에 다른 실행이 잡은 잠금을 지운다 (코드 리뷰 재현: 동시 4개 중 2개가 잡음).
+ * 죽은 잠금은 차단 파일(.break)을 잡은 한 프로세스만 치운다
+ */
+export function acquireRunLock(lockDir, root) {
+  const busy = (msg) => Object.assign(new Error(msg), { code: 'SSS_BRIEFING_RUNNING' });
+  const running = (lock) => busy(`이 위키의 브리핑이 이미 실행 중이다 (pid ${lock.pid}, ${lock.started} 시작) — 끝나면 briefings/ 에 파일이 생긴다`);
+  const path = lockPath(lockDir, root);
+  mkdirSync(lockDir, { recursive: true });
+  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), started: kstStamp() });
+  // 내용을 다 쓴 임시 파일을 링크로 건다 — wx 로 바로 쓰면 빈 파일인 순간을 다른 실행이 "죽은 잠금"으로 읽는다 (코드 리뷰)
+  const create = () => {
+    const tmp = `${path}.tmp-${process.pid}`;
+    writeFileSync(tmp, mine);
+    try {
+      linkSync(tmp, path);
+      return true;
+    } catch (e) {
+      if (e.code === 'EEXIST') return false;
+      throw e;
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+  };
+  if (!create()) {
+    const held = readLock(path);
+    if (live(held)) throw running(held);
+    const breaker = `${path}.break`;
+    // 동기 호출 몇 개 사이에 죽어 남은 차단 파일 — 몇 초 넘었으면 치운다. 치우는 순간 다른 실행이 새로 잡은 것을
+    // 지울 수 있지만, 그러려면 임계 구역(동기 호출 몇 개) 안에서 죽은 실행과 동시 경쟁이 겹쳐야 한다 — 받아들인다
+    try {
+      if (Date.now() - statSync(breaker).mtimeMs > 10e3) rmSync(breaker, { force: true });
+    } catch {}
+    try {
+      writeFileSync(breaker, String(process.pid), { flag: 'wx' });
+    } catch (e) {
+      if (e.code === 'EEXIST') throw busy('이 위키의 브리핑이 방금 다른 곳에서 시작됐다');
+      throw e;
+    }
+    try {
+      const now = readLock(path);
+      if (live(now)) throw running(now); // 차단 파일을 잡기 전에 다른 실행이 넘겨받았다
+      rmSync(path, { force: true });
+      if (!create()) throw busy('이 위키의 브리핑이 방금 다른 곳에서 시작됐다');
+    } finally {
+      rmSync(breaker, { force: true });
+    }
+  }
+  return () => {
+    if (readLock(path)?.pid === process.pid) rmSync(path, { force: true });
+  };
 }
 
 export const briefingPath = (root, date) => join(wikiDir(root, BRIEFINGS), `${date}.md`);

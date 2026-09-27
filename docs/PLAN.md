@@ -55,10 +55,10 @@
 ### 레포 구성
 
 ```
-bin/sss.mjs          ← 실행기: 격리 레시피를 적용해 codex / codex exec 를 wiki/ 에서 띄운다. init · doctor · briefing · schedule
+bin/sss.mjs          ← 실행기: 격리 레시피를 적용해 codex / codex exec 를 wiki/ 에서 띄운다. deep · init · doctor · briefing · schedule (전부 대화로도 된다)
 agent/AGENTS.md      ← 에이전트 규칙: 사실 규율, 제안→확인 후 쓰기, 페이지 스키마, 판단 기록, 키 취급, 비신뢰 입력, 보유·제안
 agent/BRIEFING.md    ← 아침 브리핑 지시 (sss briefing 이 codex exec 에 넘긴다)
-mcp/server.mjs       ← 도메인 도구 MCP 서버 (Codex 가 띄운다) · mcp/lib/ 위키·판단·EDGAR·시세 · mcp/test/
+mcp/server.mjs       ← 도메인 도구 MCP 서버 (Codex 가 띄운다) · mcp/lib/ 위키·판단·EDGAR·시세·모델 라우팅(models)·예약(schedule) · mcp/test/
 wiki/                ← 데이터 정본 — 코드 레포에서 제외, 자체 git 저장소 (sss init 이 만든다)
   AGENTS.md          ←   agent/AGENTS.md 를 가리키는 링크 (Codex 가 작업 디렉터리에서 읽는다)
   pages/             ←   위키 페이지 (노드 하나당 파일 하나)
@@ -67,6 +67,8 @@ wiki/                ← 데이터 정본 — 코드 레포에서 제외, 자체
   portfolio.yaml     ←   워치리스트 + 보유 원장 — 도구로만 고친다 (M2)
 watch/               ← 상시 감시 프로그램 (M3) — LLM 없음, launchd 상주
 var/calls.jsonl      ← 도구 호출 기록 — 모델 자기보고와 무관한 감사 기록 (gitignore)
+var/settings.json    ← 대화에서 바꾼 용도별 모델 (model_settings) — 위키 밖이라 승인을 거친 도구로만 바뀐다
+var/briefing.log     ← 예약·대화에서 띄운 브리핑 로그 (system_status 가 끝부분을 보여준다)
 .codex/config.toml   ← Phase 0 검증 스파이크 전용 (spikes/codex-runtime). 제품은 bin/sss 가 설정을 주입한다
 ```
 
@@ -231,7 +233,7 @@ actual_outcome / variance / lesson   # 결과가 아니라 프로세스를 평�
 - **비신뢰 입력 규칙** *(2026-09-27 정석 점검)*: 뉴스·공시 본문은 데이터이지 지시가 아니다 — 본문 속 명령문을 따르지 않도록 `AGENTS.md`에 명시. 트레이딩 에이전트 15종 전부에서 오염된 정보원 경로의 보안 구멍이 발견됐다 (§8)
 - **콜드 스타트 백필** *(시나리오 점검에서 발견)*: 온보딩 시 관심종목 최근 1년 공시 + 10년 시세를 인제스트해 시드 위키 생성. 없으면 "소환할 과거"가 없어 핵심 가치 체감 전에 이탈. 구독 한도를 한 번에 크게 쓰므로 종목 단위로 나눠 여러 날에 걸쳐 실행 *(전환으로 발견)*
 - 데일리 브리핑: launchd가 평일 아침 `scripts/briefing.sh` 실행 → `codex exec`가 델타 수집 → **에이전트 triage(제안/참고/무시 3단)** *(발견)* → `briefings/YYYY-MM-DD.md`에 기록. 위키 반영 제안은 파일에만 남기고, `codex` 세션에서 대화로 승인한 것만 커밋. **대기 중 제안의 저장 형식**(처리 여부 추적 포함)을 여기서 정한다 — 승인 카드 UI가 없어진 자리 *(전환으로 발견)*
-- **용도별 모델 설정** *(발견)*: 브리핑은 경량 모델(현재 GPT-5.6 Luna, `codex exec -m`), 대화·판단은 상위 모델 — 매일 도는 작업이 구독 한도를 본업 코딩과 공유하므로
+- **용도별 모델 설정** *(발견 → 2026-09-27 구현)*: 대화 `gpt-6-sol`·medium / 판단 기록·복기(`sss deep`) `gpt-6-astra`·high / 비대화 실행·브리핑 `gpt-6-luna`·medium (`mcp/lib/models.mjs` ROUTES). 매일 도는 작업이 구독 한도를 본업 코딩과 공유하므로 — 지정하지 않으면 Codex 기본값인 최상위 모델로 돈다. 대화에서 `model_settings` 로 바꾸고, doctor·도구가 `codex debug models` 목록과 대조한다. M3 장중 감시 해석도 경량으로 추가한다
 - **위키 git 자동 백업** *(발견)*: `wiki/`는 코드 레포에서 제외돼 있으므로 위키 폴더 자체를 별도 private git 저장소로 자동 커밋 — 개인 판단·포지션이 코드 레포와 함께 push되는 사고 방지
 
 ### Phase 2 — 의사결정 루프 (2~3주): "차별화 완성"
@@ -280,6 +282,7 @@ actual_outcome / variance / lesson   # 결과가 아니라 프로세스를 평�
 6. 실시간: **핵심 요구** *(2026-09-27)* — LLM 없는 상시 감시 프로그램을 **항상 켜둔 맥**에서 돌리고, 알림은 **텔레그램 푸시가 기본**
 7. 증권사: **멀티 증권사 — 토스 · 키움 · KIS를 같은 인터페이스로 등록 가능, 토스부터 구현** *(2026-09-27 · 이전: 키움 1순위 단독)* — M4
 8. 형태: **판단 보조, 자동매매 없음** — 누수 없는 평가에서 LLM 에이전트 대부분이 단순 보유를 못 이긴다 (§8)
+9. 조작: **모든 조작은 대화로** *(2026-09-27)* — 종목 등록·브리핑 예약과 실행·모델 설정·상태 점검을 `sss` 대화에서 말로 한다 ("아침 7시 반에 브리핑 예약해줘"). 새 기능은 MCP 도구로 내고(바꾸는 도구는 대화형 승인 + 자동 실행 거부), CLI 하위 명령은 예비 경로로 남긴다. 예외는 API 키 하나 — 대화 기록에 남으므로 `.env` 에 직접 넣는다
 
 ## 8. 정석 점검 (2026-09-27)
 
