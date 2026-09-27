@@ -1,0 +1,18 @@
+node_modules/
+dist/
+out/
+*.log
+
+# OMC 운영 아티팩트 (.omc/skills 는 예외적으로 커밋 대상)
+.omc/
+!.omc/skills/
+
+# 로컬 자격증명 — 절대 커밋 금지
+.env
+.env.*
+*.key
+
+# 위키 데이터는 개인 자산이므로 저장소와 분리한다
+/wiki/
+*.sqlite
+*.sqlite-*
