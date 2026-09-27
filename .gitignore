@@ -16,3 +16,6 @@ out/
 /wiki/
 *.sqlite
 *.sqlite-*
+
+# 스파이크 실행 산출물
+.runs/

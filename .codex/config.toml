@@ -1,0 +1,30 @@
+# 프로젝트 스코프 Codex 설정 — 이 레포를 trusted 프로젝트로 등록해야 로드된다.
+# (레포 루트에서 `codex`를 한 번 실행해 신뢰를 선택하면 ~/.codex/config.toml 에 기록된다)
+#
+# 투자 리서치 에이전트에 필요 없는 도구 노출을 끈다 (Phase 0 격리 검증: 85개 → 24개).
+# 전역 ~/.codex/config.toml 의 MCP 서버는 여기서 끌 수 없어 실행기에서 이름별로 끈다 (spikes/codex-runtime/isolation.mjs).
+web_search = "disabled"
+
+[features]
+apps = false                      # ChatGPT 계정 커넥터 (사이트 배포·권한 변경 도구 포함)
+browser_use = false
+browser_use_external = false
+computer_use = false
+image_generation = false
+multi_agent = false
+plugins = false
+remote_plugin = false
+tool_suggest = false
+skill_search = false
+skill_mcp_dependency_install = false
+goals = false
+in_app_browser = false
+
+# Phase 0 검증 단계라 서버는 spikes/codex-runtime/ 을 가리킨다. Phase 1에서 mcp/ 로 옮긴다.
+
+[mcp_servers.sss]
+command = "node"
+args = ["spikes/codex-runtime/server.mjs"]
+required = true                         # 도구 서버가 안 뜨면 조용히 진행하지 말고 실패
+startup_timeout_sec = 20
+default_tools_approval_mode = "approve" # 조회 전용 도구 — codex exec(비대화형)에서 승인 대기로 멈추지 않게

@@ -1,6 +1,7 @@
 # Phase 0 검증 결과
 
 > 2026-08-19 실측 · 코드: `spikes/` · 환경: Node 24.19, SQLite 3.51.0, Claude Code CLI 2.1.235
+> 2026-09-27 추가 실측 (§10 Codex 런타임) · Codex CLI 0.157.1, ChatGPT 로그인 · #1~3·#6은 Claude Agent SDK 기준이며 런타임 전환 후 #11~13이 대체한다
 
 ## 요약
 
@@ -16,6 +17,9 @@
 | 8 | 네이티브 의존성 제거 | ✅ | Node 24 내장 `node:sqlite`가 FTS5 trigram 지원 |
 | 9 | 무계좌 한국 시세 | ✅ | 계층 분리 어댑터 13/13 — 네이버 **0.0분**(시간외 포함) / 다음 / 야후 20분 폴백 |
 | 10 | **공시 → 이벤트 추출 → 위키 생성** | ✅ | 13/14 — 스키마 준수, 기존 엔티티 재사용, 출처 필수, 인덱스 왕복 |
+| 11 | **Codex + ChatGPT 구독으로 프로젝트 MCP 도구 자율 호출** | ✅ | `codex exec`가 `sss` 도구를 스스로 골라 호출, 서버 측 기록과 일치. 18초 (Claude 16초) |
+| 12 | **Codex 도구 격리** | ✅ (레시피 필요) | 기본 85개 노출(전역 MCP·ChatGPT 커넥터·빌트인) → 프로젝트 설정 + 전역 서버 이름별 끄기로 24개 |
+| 13 | **Codex 샌드박스·과금 경로** | ✅ | 워크스페이스 밖 쓰기·셸 네트워크 차단, MCP 도구 네트워크는 동작. `auth.json`에 ChatGPT 토큰만 |
 | — | DART 공시 | ⏸ | 무료 키 발급 필요. **파이프라인은 EDGAR로 이미 검증됨** — 소스만 교체 |
 | — | ~~KIS 실시간~~ | **선택으로 강등** | 계좌 없이도 네이버로 0분 확보. 모의투자 우회는 불가(실계좌 선행 필수) |
 
@@ -340,3 +344,59 @@ DART 키가 나오면 **"공시 → 이벤트·관계 추출 → 위키 페이�
 | 장중 "지금 얼마?" | 20분 지연도 대체로 수용 가능 |
 
 정작 실시간성이 중요한 것은 **DART 공시이고 그건 무료로 즉시 열린다.** "시세는 T+1, 공시는 실시간"이 이 앱의 실제 구조다.
+
+## 10. Codex 런타임 — 구독 인증·프로젝트 MCP·격리·샌드박스 ⭐
+
+`spikes/codex-runtime/` · 실행: `node verify.mjs` (21/21) · 격리 비교: `node isolation.mjs` · 설정: 레포 루트 `.codex/config.toml`
+
+2026-09-27 런타임을 Claude Agent SDK에서 Codex로 바꾸면서 #1~3·#6을 다시 검증했다. 도메인 도구는 Claude SDK 전용 `tool()` 래퍼 대신 **표준 MCP stdio 서버**로 감쌌다 (`server.mjs` — EDGAR·위키 검색·그래프·유사 케이스 5개, 로직은 기존 스파이크 재사용). 서버는 모든 호출을 `.calls.log`에 남겨, Codex 이벤트 스트림과 **독립된 두 번째 증거**로 대조한다.
+
+| 검증 | 결과 |
+|---|---|
+| MCP 서버 단독 동작 (Codex 없이) — 실패 원인을 Codex와 분리 | ✅ 4/4 |
+| ChatGPT 로그인, `CODEX_API_KEY` 없음, `auth.json`에 API 키 공존 없음 (`codex doctor`) | ✅ |
+| `codex exec`가 프로젝트 `.codex/config.toml`의 도구를 스스로 골라 호출 | ✅ `recent_filings` → `xbrl_concept`, 18초 |
+| 답변 각 줄에 근거 도구 표기 — 서버 `instructions` 필드만으로 규율 전달 | ✅ |
+| 위키 루프: `wiki_search` → `wiki_graph_query` → `find_similar_cases` 연쇄 호출, 2024 판단 소환 | ✅ 35초 |
+| read-only 샌드박스에서도 MCP 도구의 네트워크는 동작 | ✅ |
+| workspace-write: 레포 안 쓰기 허용 / 홈 디렉터리 쓰기 차단(`Operation not permitted`) / 셸 `curl` 차단 — **모델 없이** `codex sandbox -P :workspace`로 직접 확인 | ✅ |
+| 격리 레시피 적용 시 전역 MCP·ChatGPT 커넥터 사라지고 `sss`만 동작 | ✅ |
+
+**설계 원칙이 실측으로 확정됐다**: 셸은 네트워크가 막혀 있고 MCP 도구는 뚫려 있다. "외부 데이터는 MCP 도구로만"이 권고가 아니라 런타임의 기본 구조다 — 출처 기록·공식/비공식 게이트를 도구 계층에 두면 에이전트가 우회할 경로가 없다.
+
+### 도구 노출 — Codex도 Claude SDK와 같은 문제가 있다, 더 크게
+
+기본 실행에서 에이전트에게 **85개 도구**가 노출됐다 (모델 자기보고 + 실제 호출로 교차 확인):
+
+| 출처 | 개수 | 문제 |
+|---|---|---|
+| **ChatGPT 계정 커넥터** (`codex_apps`) | 39 | 설정 파일과 무관하게 계정에서 붙는다. **사이트 배포·환경변수 수정·자녀보호 설정 변경·권한 변경** 도구 포함 |
+| 전역 `~/.codex/config.toml` MCP | 16 | `filesystem.write_file` 은 **Codex 샌드박스 밖에서 도는 별도 프로세스**라 샌드박스 우회 경로가 된다. 테스트 중 에이전트가 `context7`을 실제 호출 |
+| 빌트인 (이미지 생성·웹·목표·플러그인 등) | 25 | 리서치 에이전트에 불필요 |
+| **우리 도구 `sss`** | 5 | |
+
+### 격리 방법 비교 (`isolation.mjs`)
+
+| 방법 | `sss` | 전역 유입 | 노출 | 비고 |
+|---|---|---|---|---|
+| 기본 | ✅ | ⚠️ | 85 | |
+| `--ignore-user-config` | ❌ | 없음 | 64 | **신뢰 정보도 사용자 설정에 있어 프로젝트 설정까지 끊긴다.** `-c`로 신뢰를 넘겨도 안 됨. 대화형 `codex`에는 이 옵션 자체가 없다 |
+| `--ignore-user-config` + `-c`로 서버 주입 | ✅ | 없음 | 69 | 승인 모드(`default_tools_approval_mode="approve"`)를 같이 넘기지 않으면 exec에서 *"requires approval, but approval policy is never"*로 호출 실패 — 처음 ❌로 보인 원인 |
+| 위 + `--disable` 기능 13개 + `web_search="disabled"` | ✅ | 없음 | 24 | exec 전용 |
+| **전역 서버 이름별 `-c mcp_servers.<이름>.enabled=false` + 기능 끄기는 프로젝트 설정** | ✅ | 없음 | **24** | **채택.** 대화형·exec 공통, 설정은 레포에 |
+
+**채택한 레시피**:
+- `.codex/config.toml`(레포): `web_search = "disabled"` + `[features]` 13개 끄기(`apps` 포함) + `sss` 서버(`default_tools_approval_mode = "approve"`, `required = true`)
+- 실행기(Phase 1 `bin/` 스크립트): `~/.codex/config.toml`의 MCP 서버 이름을 읽어 `-c mcp_servers.<이름>.enabled=false`를 붙여 `codex` / `codex exec`를 띄운다
+
+남는 24개: 셸·`apply_patch`(샌드박스 안)·시계·이미지 보기·MCP 리소스 조회·사용자 질문, `collaboration.*` 6개(서브에이전트 — `multi_agent`를 꺼도 남는다, 기능 플래그로는 못 끔), 그리고 `sss` 5개.
+
+**부수 효과 — 토큰 38% 절감**: 같은 질문(①)의 입력 토큰이 기능 끄기 전 63,443 → 후 39,493. 도구 정의가 매 요청 컨텍스트에 실리므로, 노출을 줄이는 것이 곧 구독 한도 절약이다. 매일 도는 브리핑에서 누적된다.
+
+### 기타 관찰
+
+- **신뢰 등록**: 프로젝트 `.codex/config.toml`은 `~/.codex/config.toml`에 `[projects."<경로>"] trust_level = "trusted"`가 있어야 로드된다 (대화형 첫 실행 시 묻는 그 설정). 새 머신에선 온보딩 점검 항목.
+- **사용자 전역 설정의 무시된 항목**: `codex doctor`가 전역 `mcp_servers.*.type`, `github.headers` 등 4개 설정을 인식하지 않는다고 경고 — `github` 서버는 토큰 헤더가 무시돼 인증 실패 상태였다. 이 프로젝트와는 무관한 사용자 설정 문제.
+- **모델이 "실패했다"고 보고한 명령이 실제로는 실행 기록이 없었다.** 첫 샌드박스 검증은 모델에게 셸 명령 3개를 시키고 결과 파일 유무로 판정했는데, 홈 디렉터리 쓰기 명령은 이벤트 스트림에 실행 기록 없이 *"operation not permitted로 실패"*라는 보고만 남았다. 파일이 없으니 검사는 통과했지만, 실행 안 해도 통과하는 검사였다. `codex sandbox -P :workspace`로 모델 없이 같은 정책을 걸어 재검증했고(차단 확인), 검증 코드도 그 방식으로 바꿨다. §7의 하드코딩 교훈과 같은 계열 — **모델 자기보고는 증거가 아니다.**
+- **수동 확인 1건 남음**: 대화형 `codex`의 `/status`에서 사용량이 ChatGPT 플랜 한도에서 차감되는지 눈으로 확인. 자동 검증으로는 `auth.json` 저장 모드(`chatgpt`, API 키 없음)까지 확인했다.
+

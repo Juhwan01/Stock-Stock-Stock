@@ -2,7 +2,7 @@
 
 > 작성일: 2026-08-19 · 리서치 4건 종합 · **완전 개인용으로 확정** (수익화·배포 없음, 단 완성도 있게)
 >
-> **개정 2026-09-27 — 런타임 전환**: LLM은 **Codex(내 ChatGPT 구독)**, 형태는 데스크탑 앱이 아니라 **레포 안에서 도는 에이전트**로 바꾼다. 쌓이는 자산(마크다운 위키 + SQLite)과 데이터 어댑터는 그대로이고, 바뀌는 건 에이전트 런타임과 UI 껍데기뿐이다. [SPIKE-RESULTS.md](./SPIKE-RESULTS.md)의 #1~3(구독 인증·도구 호출)과 격리 관련 발견(§4, §7 실패 1건)은 Claude Agent SDK 기준이라 Codex에서 다시 검증해야 한다.
+> **개정 2026-09-27 — 런타임 전환**: LLM은 **Codex(내 ChatGPT 구독)**, 형태는 데스크탑 앱이 아니라 **레포 안에서 도는 에이전트**로 바꾼다. 쌓이는 자산(마크다운 위키 + SQLite)과 데이터 어댑터는 그대로이고, 바뀌는 건 에이전트 런타임과 UI 껍데기뿐이다. [SPIKE-RESULTS.md](./SPIKE-RESULTS.md)의 #1~3(구독 인증·도구 호출)과 격리 관련 발견(§4, §7 실패 1건)은 Claude Agent SDK 기준이었고, **2026-09-27 Codex로 재검증 완료** (SPIKE-RESULTS §10 — 21/21, 격리는 레시피 필요).
 
 ## 0. 한 줄 정의
 
@@ -43,7 +43,7 @@
 | 에이전트 | **Codex CLI** — 대화는 `codex`, 예약 작업은 `codex exec` | 내 ChatGPT 구독으로 구동. 에이전트 루프·파일 편집·세션·MCP 클라이언트를 공짜로 얻음. 규칙(`AGENTS.md`)과 커스텀 도구만 얹으면 됨 |
 | 인터페이스 | **레포 자체** — `AGENTS.md` + 프로젝트 `.codex/config.toml` | GUI 불필요. 쌓이는 자산이 UI와 무관하므로 Electron은 껍데기일 뿐이었다. 위키 열람·그래프는 Obsidian이 대신한다 |
 | 도메인 도구 | **표준 MCP 서버** (Node, stdio, `@modelcontextprotocol/sdk`) | Claude SDK 전용 `tool()` 래퍼 대신 표준 MCP → Codex·Claude Code 양쪽에서 동작. LLM 락인이 도구 계층에서 끊긴다 |
-| 예약 실행 | **launchd** → `scripts/briefing.sh` → `codex exec` | 앱을 "여는" 순간이 없으므로 브리핑 트리거를 시간으로 바꾼다 |
+| 예약 실행 | **launchd** → `scripts/briefing.sh` → `codex exec` · 장중엔 LLM 없는 공시 폴러가 필요할 때만 `codex exec` 호출 | 앱을 "여는" 순간이 없으므로 트리거를 시간·이벤트로 바꾼다. 폴링 자체는 구독 한도를 쓰지 않는다 |
 | 지식 저장 | 마크다운 정본 + SQLite 인덱스 (**Node 내장 `node:sqlite`**) | 파일이 자산으로 남고(Obsidian으로도 열림) 인덱스는 재구축 가능. 네이티브 의존성 없음 → `npm install`만으로 동작 |
 | 검색 | v1: FTS5 trigram + **2글자 LIKE 폴백 라우터** → v2: + sqlite-vec 하이브리드 | 한국어는 trigram 필수(`하이닉스`↛`SK하이닉스`), 단 2글자 MATCH 불가라 라우터 필요 |
 | 그래프 | SQLite nodes/edges + 재귀 CTE | 그래프 DB 도입 보류 (KuzuDB 아카이브 사태) |
@@ -148,7 +148,7 @@ actual_outcome / variance / lesson   # 결과가 아니라 프로세스를 평�
 - [x] SEC EDGAR 경로 (키 불필요) — 티커→CIK, 공시 목록, XBRL 재무 시계열
 - [x] 한국어 FTS5 검증 — **trigram 필수 + 2글자 쿼리 LIKE 폴백** (unicode61은 `하이닉스`↛`SK하이닉스`로 부적합)
 - [x] ~~도구 네임스페이스 격리 — `settingSources: []` 없으면 외부 MCP 54개 유입~~ *(Claude SDK 전용 발견 — Codex에서 재검증)*
-- [ ] **Codex 런타임 검증** *(2026-09-27 전환으로 추가)*: ① 프로젝트 `.codex/config.toml`에 등록한 MCP 도구를 ChatGPT 로그인 상태의 `codex exec`가 자율 호출 (프로젝트 스코프 등록이 안 되면 전역 등록 + 프로필로 대체) ② 전역 `~/.codex/config.toml`의 MCP가 섞여 들어오는지 — 섞이면 격리 방법 확정 ③ 위키 폴더 밖 쓰기가 샌드박스에서 막히는지 ④ `/status`로 구독 한도에서 차감되는지 (API 과금 아님)
+- [x] **Codex 런타임 검증** *(2026-09-27 전환으로 추가)* — `spikes/codex-runtime/` 21/21. ChatGPT 로그인으로 `codex exec`가 프로젝트 MCP 도구 자율 호출(18초), 샌드박스(밖 쓰기·셸 네트워크 차단, MCP 네트워크 허용) 확인. **기본 85개 도구 노출**(ChatGPT 커넥터 39·전역 MCP 16·빌트인 25) → 격리 레시피로 24개, 입력 토큰 −38%. 상세: [SPIKE-RESULTS.md](./SPIKE-RESULTS.md) §10
 - [x] **위키 지식그래프 전체 루프** — 검색·관계탐색·바이템포럴·유사케이스 7개 검증 통과 (`spikes/wiki/`)
 - [x] **무계좌 한국 시세** — 계층 분리 어댑터 13/13 통과 (`spikes/kr-quotes/`). 네이버 0.8분 / 야후 20.0분 실측, 교차검증 일치
 - [ ] DART 키 발급 → 공시 fetch → 이벤트/관계 추출 → 위키 페이지 생성 PoC  *(키 발급 대기 — 데이터 소스 중 남은 유일한 핵심 미검증 경로. 런타임 쪽 미검증은 위 Codex 항목)*
@@ -157,7 +157,7 @@ actual_outcome / variance / lesson   # 결과가 아니라 프로세스를 평�
 
 ### Phase 1 — 코어 (3~4주): "축적이 되는 리서치 도구"
 - 레포 골격: `AGENTS.md`(규칙) + `.codex/config.toml`(프로젝트 MCP 등록) + `mcp/` 서버 + 설정(DART/공공데이터포털/네이버 키 — `.env`, gitignore 처리됨). **전제조건 명시: Codex CLI 설치 + `codex login`(ChatGPT)**. 키는 대화에 붙여넣지 않고 `.env`에 직접 입력 — 세션 로그에 남지 않게 `AGENTS.md` 규칙으로 둔다 *(전환으로 발견)*
-- 격리: Phase 0 Codex 검증 결과에 따라 전역 MCP 유입 차단. 샌드박스는 `workspace-write`, 외부 데이터는 MCP 도구 경유만
+- **실행기 `bin/sss`** (격리 레시피 — SPIKE-RESULTS §10): `~/.codex/config.toml`의 MCP 서버를 이름별로 `-c mcp_servers.<이름>.enabled=false`로 끄고 `codex`(대화)·`codex exec`(예약)를 띄운다. 기능 끄기(`apps` 등 13개 + 웹검색)는 `.codex/config.toml`에 둔다. `--ignore-user-config`는 신뢰 정보까지 끊어 쓸 수 없다. 샌드박스는 `workspace-write`, 외부 데이터는 MCP 도구 경유만 (셸 네트워크는 차단됨 — 실측)
 - 위키 편집은 **Codex 빌트인 파일 편집 재사용** (별도 CRUD 도구 불필요)
 - 커스텀 MCP 도구는 SQLite 인덱스가 필요한 것만: `wiki_search`(trigram+LIKE 라우터) · `wiki_graph_query`(k-hop) · `find_similar_cases` · `decision_record`/`decision_update`
 - 데이터 MCP 도구: DART 공시 · 공공데이터포털 시세 · EDGAR(스파이크 완료, 이식) · 네이버 뉴스
@@ -172,7 +172,8 @@ actual_outcome / variance / lesson   # 결과가 아니라 프로세스를 평�
 - 대화에서 판단 감지 시 `decision_record` 제안 → 대화형으로 필드 채움 (별도 UI 없음) — **체결 자동 연동은 없음(자가 신고), v1 한계로 명시**
 - **무효화 조건 작성 가이드** *(시나리오 점검에서 발견)*: 애매한 조건은 나중에 판정 불가 — 기록 시 에이전트가 데이터/이벤트/날짜 조건 중 하나의 **검증 가능한 형태로 재작성 제안**
 - **컨센서스 스냅샷** *(정보 지도 점검에서 발견)*: Decision 기록 시점의 시장 기대치(추정 EPS·목표가)를 함께 저장 — "기대 vs 실제" 대조의 기준점
-- invalidation_condition 주기 점검(브리핑에 포함 — 판정 시점이 예약 주기에 묶이므로 실적 발표일엔 장중 추가 실행 *(전환으로 발견)*) + 결과 업데이트 플로우 + **미기록 outcome 리마인더** *(발견)*
+- invalidation_condition 주기 점검(브리핑에 포함) + 결과 업데이트 플로우 + **미기록 outcome 리마인더** *(발견)*
+- **장중 공시 감시 (준실시간)** *(2026-09-27 추가)*: launchd가 장중 5~10분 주기로 **LLM 없는 폴러**(DART 신규 공시 목록만 조회)를 돌리고, 관심종목·열린 Decision에 걸리는 공시가 있을 때만 `codex exec`로 분석 → macOS 알림. 폴링은 구독 한도를 쓰지 않는다. 실적 발표일의 무효화 판정 타이밍 문제(전환으로 발견)도 이걸로 해소
 - 알림: 브리핑 파일 최상단 + macOS 알림(`osascript`), 텔레그램은 옵션
 - 유사 케이스 소환 → 브리핑·대화에 자동 표면화
 - 바이템포럴 무효화 + 타임라인 (마크다운으로 생성, Obsidian에서 열람)
@@ -190,6 +191,7 @@ actual_outcome / variance / lesson   # 결과가 아니라 프로세스를 평�
 |---|---|
 | LLM 추출 품질 (중복 엔티티, 잘못된 인과) | 스키마 컨텍스트 제공 + 내 확인 후 커밋 + 출처 필수 + confidence |
 | OpenAI 구독 정책·한도 변동 (Codex 모델 교체·단종이 잦음 — 예: 2026-08-31 GPT-5.4 ChatGPT 로그인 제공 종료) | 개인 사용은 가장 안전한 축. 모델명을 스크립트에 하드코딩하지 않고 설정으로 뺀다. 도구가 표준 MCP라 최악의 경우 Claude Code로 런타임만 교체 |
+| Codex 기본 도구 노출 — ChatGPT 계정 커넥터(사이트 배포·권한 변경 포함)·전역 MCP(샌드박스 밖에서 도는 `filesystem.write_file`)까지 85개 (실측) | 격리 레시피(`bin/sss` + `.codex/config.toml`). **Codex는 기본 켜짐 기능을 자주 추가하므로 `codex update` 후 `spikes/codex-runtime/verify.mjs` 재실행**을 루틴으로 |
 | `codex exec`가 조용히 API 과금으로 전환 (`CODEX_API_KEY` 환경변수, 구 `auth.json`에 키·토큰 공존) | `briefing.sh`에서 `unset CODEX_API_KEY` + `codex login status` 선확인 |
 | 구독 한도를 본업 코딩과 공유 — 브리핑이 코딩을 막음 | 브리핑은 경량 모델 · 종목 수 상한 · 한도 임박 시 브리핑 축약 |
 | KIS API 장애/한도 | 키움 REST 보조 연동 여지 |

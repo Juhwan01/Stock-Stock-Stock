@@ -1,0 +1,14 @@
+{
+  "name": "codex-runtime",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Phase 0: Codex 런타임에서 프로젝트 MCP 도구·격리·샌드박스·과금 경로 검증",
+  "scripts": {
+    "verify": "node verify.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "zod": "^4.4.3"
+  }
+}
