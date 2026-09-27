@@ -51,15 +51,21 @@
 ### 레포 구성
 
 ```
-AGENTS.md            ← Codex가 자동으로 읽는 규칙: 스키마, 출처 필수, "제안 → 확인 후 커밋", 비공식 시세 위키 금지
-.codex/config.toml   ← 프로젝트 스코프 MCP 서버 등록
-mcp/                 ← 도메인 도구 MCP 서버 (spikes/의 wiki·kr-quotes·edgar 코드를 이식)
-scripts/briefing.sh  ← launchd가 매일 호출 → codex exec → briefings/YYYY-MM-DD.md
-wiki/                ← 데이터 정본 (.gitignore 처리됨 — 자체 private git 저장소로 백업)
+bin/sss.mjs          ← 실행기: 격리 레시피를 적용해 codex / codex exec 를 wiki/ 에서 띄운다. init · doctor
+agent/AGENTS.md      ← 에이전트 규칙: 사실 규율, 제안→확인 후 쓰기, 페이지 스키마, 판단 기록, 키 취급
+mcp/server.mjs       ← 도메인 도구 MCP 서버 (Codex 가 띄운다) · mcp/lib/ 위키·판단·EDGAR·시세 · mcp/test/
+wiki/                ← 데이터 정본 — 코드 레포에서 제외, 자체 git 저장소 (sss init 이 만든다)
+  AGENTS.md          ←   agent/AGENTS.md 를 가리키는 링크 (Codex 가 작업 디렉터리에서 읽는다)
+  pages/             ←   위키 페이지 (노드 하나당 파일 하나)
+  briefings/         ←   아침 브리핑 (M2)
+var/calls.jsonl      ← 도구 호출 기록 — 모델 자기보고와 무관한 감사 기록 (gitignore)
+.codex/config.toml   ← Phase 0 검증 스파이크 전용 (spikes/codex-runtime). 제품은 bin/sss 가 설정을 주입한다
 ```
 
+- **작업 디렉터리 = `wiki/`** *(2026-09-27 M1 확정)*: 샌드박스 쓰기 범위가 위키뿐이라 **에이전트는 제품 코드(`mcp/`·`bin/`)를 고칠 수 없다** (E2E·`codex sandbox`로 확인). 위키가 별도 git 저장소라 Codex 의 프로젝트 루트도 위키가 되고, 규칙 파일은 링크로 공급한다. 원래 Phase 1 의 "작업 디렉터리를 위키 폴더로 고정"을 Codex 에서 그대로 구현한 형태.
+- **설정은 파일이 아니라 실행기가 주입한다**: `wiki/`에는 레포의 `.codex/config.toml`이 닿지 않으므로 sss 서버·기능 끄기·전역 서버 끄기를 전부 `-c`/`--disable`로 넘긴다. 설정의 원본이 코드 한 곳(`bin/sss.mjs`)에 있다.
 - **셸 샌드박스와 데이터 수집을 분리한다**: 외부 데이터(DART·시세·EDGAR)는 전부 MCP 도구를 거친다. 에이전트가 셸로 직접 `curl`하게 두지 않는다 — 출처 기록·공식/비공식 게이트가 도구 계층에 있기 때문이다.
-- **과금 경로 고정**: `CODEX_API_KEY` 환경변수가 있으면 `codex exec`가 조용히 API 과금으로 넘어간다(보고된 사고 다수). `briefing.sh`는 이 변수를 `unset`하고 `codex login status`로 로그인 상태를 먼저 확인한다.
+- **과금 경로 고정**: `CODEX_API_KEY` 환경변수가 있으면 `codex exec`가 조용히 API 과금으로 넘어간다(보고된 사고 다수). `bin/sss.mjs`가 자식 환경에서 이 변수를 지우고, `sss doctor`가 로그인 방식과 `auth.json` 저장 모드를 점검한다.
 
 ### 지식맵 스키마 (바이템포럴)
 
@@ -151,13 +157,18 @@ actual_outcome / variance / lesson   # 결과가 아니라 프로세스를 평�
 - [x] **Codex 런타임 검증** *(2026-09-27 전환으로 추가)* — `spikes/codex-runtime/` 21/21. ChatGPT 로그인으로 `codex exec`가 프로젝트 MCP 도구 자율 호출(18초), 샌드박스(밖 쓰기·셸 네트워크 차단, MCP 네트워크 허용) 확인. **기본 85개 도구 노출**(ChatGPT 커넥터 39·전역 MCP 16·빌트인 25) → 격리 레시피로 24개, 입력 토큰 −38%. 상세: [SPIKE-RESULTS.md](./SPIKE-RESULTS.md) §10
 - [x] **위키 지식그래프 전체 루프** — 검색·관계탐색·바이템포럴·유사케이스 7개 검증 통과 (`spikes/wiki/`)
 - [x] **무계좌 한국 시세** — 계층 분리 어댑터 13/13 통과 (`spikes/kr-quotes/`). 네이버 0.8분 / 야후 20.0분 실측, 교차검증 일치
-- [ ] DART 키 발급 → 공시 fetch → 이벤트/관계 추출 → 위키 페이지 생성 PoC  *(키 발급 대기 — 데이터 소스 중 남은 유일한 핵심 미검증 경로. 런타임 쪽 미검증은 위 Codex 항목)*
+- [x] **DART 공시 → 본문 → 위키 Event** *(2026-09-27)* — 실제 Codex 로 SK하이닉스 풍문 답변 공시를 골라 본문을 읽고 `event-sk-hynix-japan-fab-response-2026-09-18` 페이지 작성: DART 원문 출처·스키마 준수·기존 `company-sk-hynix` 재사용 (`npm run test:e2e` 18/18). 발견: 거래소 공시(풍문 답변 등) 원문은 DART XML 이 아니라 HTML(xforms) — 파서가 두 형식을 모두 읽는다
 - [ ] 공공데이터포털 키 발급 → 공식 일별 시세 경로 검증  *(자동승인, 5분)*
 - [ ] ~~KIS 앱키 → 실시간 시세~~ → **선택으로 강등.** 없어도 제품 성립
 
 ### Phase 1 — 코어 (3~4주): "축적이 되는 리서치 도구"
+
+> **진행 (2026-09-27)** — **M1 에이전트 골격 완료 + 독립 코드 리뷰 반영**: `bin/sss`(격리 실행기·init·doctor) · `agent/AGENTS.md` · MCP 도구 14개(위키 4 · 판단 2 · DART 4 · EDGAR 2 · 시세 2) · 단위 테스트 55 + 실제 Codex E2E 18/18.
+> 리뷰(High 4 · Medium 7)에서 고친 것: 서버가 링크를 따라 위키 밖에 쓰던 우회 · 틀린 엣지 하나로 위키 도구 전체가 죽던 문제 · 전역 MCP 서버 감지를 `codex mcp list --json` + 실행 전 사전 점검으로 교체 · 실행되지 않아도 통과하던 E2E 검사 · 에이전트의 규칙 파일 변조 감지 · 판단 기록 도구는 대화형에서 사용자 승인, 자동 실행에서 거부 · KST 날짜 · price_history 공식 전용.
+> **다음 세션: M2** — 워치리스트 · 아침 브리핑(launchd + `sss exec`) · 대기 중 제안 저장 형식(SCENARIOS 공백 #9) → **M3** 콜드 스타트 백필 · 위키 git 자동 커밋 · 용도별 모델. 실제 위키는 아직 `sss init` 전이다.
+
 - 레포 골격: `AGENTS.md`(규칙) + `.codex/config.toml`(프로젝트 MCP 등록) + `mcp/` 서버 + 설정(DART/공공데이터포털/네이버 키 — `.env`, gitignore 처리됨). **전제조건 명시: Codex CLI 설치 + `codex login`(ChatGPT)**. 키는 대화에 붙여넣지 않고 `.env`에 직접 입력 — 세션 로그에 남지 않게 `AGENTS.md` 규칙으로 둔다 *(전환으로 발견)*
-- **실행기 `bin/sss`** (격리 레시피 — SPIKE-RESULTS §10): `~/.codex/config.toml`의 MCP 서버를 이름별로 `-c mcp_servers.<이름>.enabled=false`로 끄고 `codex`(대화)·`codex exec`(예약)를 띄운다. 기능 끄기(`apps` 등 13개 + 웹검색)는 `.codex/config.toml`에 둔다. `--ignore-user-config`는 신뢰 정보까지 끊어 쓸 수 없다. 샌드박스는 `workspace-write`, 외부 데이터는 MCP 도구 경유만 (셸 네트워크는 차단됨 — 실측)
+- **실행기 `bin/sss`** (격리 레시피 — SPIKE-RESULTS §10): `~/.codex/config.toml`의 MCP 서버를 이름별로 `-c mcp_servers.<이름>.enabled=false`로 끄고 `codex`(대화)·`codex exec`(예약)를 띄운다. 기능 끄기(`apps` 등 13개 + 웹검색)와 sss 서버 주입도 실행기가 한다 — 작업 디렉터리가 `wiki/`라 레포의 `.codex/config.toml`이 닿지 않는다. `--ignore-user-config`는 신뢰 정보까지 끊어 쓸 수 없다. 샌드박스는 `workspace-write`, 외부 데이터는 MCP 도구 경유만 (셸 네트워크는 차단됨 — 실측)
 - 위키 편집은 **Codex 빌트인 파일 편집 재사용** (별도 CRUD 도구 불필요)
 - 커스텀 MCP 도구는 SQLite 인덱스가 필요한 것만: `wiki_search`(trigram+LIKE 라우터) · `wiki_graph_query`(k-hop) · `find_similar_cases` · `decision_record`/`decision_update`
 - 데이터 MCP 도구: DART 공시 · 공공데이터포털 시세 · EDGAR(스파이크 완료, 이식) · 네이버 뉴스
