@@ -14,9 +14,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseEnv } from 'node:util';
 import { createWiki, search, traverse, findSimilarCases, EDGE_RELS } from './lib/wiki.mjs';
 import { recordShape, updateShape, recordDecision, updateDecision, openDecisions } from './lib/decision.mjs';
 import { recentFilings, xbrlConcept } from './lib/edgar.mjs';
@@ -24,11 +26,23 @@ import { createDart } from './lib/dart.mjs';
 import { quote, history } from './lib/quotes.mjs';
 import { readPortfolio, summarize, updateWatchlist, updateHoldings, watchlistShape, holdingsShape } from './lib/portfolio.mjs';
 import { addProposal, listProposals, resolveProposal, addShape, listShape, resolveShape } from './lib/proposals.mjs';
-import { readInbox, RUN_ID } from './lib/briefing.mjs';
+import { readInbox, readState, runningBriefing, RUN_ID } from './lib/briefing.mjs';
+import { codexModels, routeTable, updateRoute, ROUTES } from './lib/models.mjs';
+import { installSchedule, scheduleStatus, uninstallSchedule, TIME } from './lib/schedule.mjs';
+import { kstDate } from './lib/store.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+// 서버의 작업 디렉터리는 에이전트가 쓸 수 있는 위키다 — PATH 에 상대 경로가 있으면 위키에 심은 codex 가 샌드박스 밖에서 불린다
+process.env.PATH = (process.env.PATH ?? '').split(':').filter((p) => p.startsWith('/')).join(':');
+// 대화에서 띄우는 브리핑에 넘길 환경 — 아래에서 .env 키를 싣기 전의 것 (브리핑은 키 파일을 직접 읽는다)
+const BASE_ENV = { ...process.env };
+// .env 의 데이터 키를 싣는다. SSS_ 값은 사용자 설정 두 개만 — 실행 모드·경로·테스트용 값이 .env 로 바뀌면
+// 서버와 실행기·launchd 가 서로 다른 설정·잠금을 보게 된다 (코드 리뷰). 이미 있는 환경 변수가 이긴다
+const ENV_SETTINGS = ['SSS_ALLOW_UNLICENSED', 'SSS_ALLOW_ELEVATED_RISK'];
 try {
-  process.loadEnvFile(join(REPO, '.env'));
+  for (const [k, v] of Object.entries(parseEnv(readFileSync(process.env.SSS_ENV_FILE ?? join(REPO, '.env'), 'utf8')))) {
+    if ((!k.startsWith('SSS_') || ENV_SETTINGS.includes(k)) && process.env[k] === undefined) process.env[k] = v;
+  }
 } catch (e) {
   if (e.code !== 'ENOENT') throw e;
 }
@@ -36,6 +50,15 @@ const WIKI_DIR = process.env.SSS_WIKI_DIR ?? join(REPO, 'wiki');
 const CALL_LOG = process.env.SSS_CALL_LOG ?? join(REPO, 'var', 'calls.jsonl');
 // bin/sss 가 넣는다. exec 면 사용자가 없는 자동 실행 — 사용자 결정을 대신하는 도구를 거부한다
 const MODE = process.env.SSS_MODE === 'exec' ? 'exec' : 'chat';
+// 운영 도구는 실행기가 대화라고 알려준 경우에만 — 모드를 모르면 막는다
+const CHAT = process.env.SSS_MODE === 'chat';
+const SSS = join(REPO, 'bin', 'sss.mjs');
+const VAR = process.env.SSS_VAR_DIR ?? join(REPO, 'var');
+const BRIEFING_LOG = join(VAR, 'briefing.log');
+/** 사용자가 없는 자동 실행에서 설정·예약·실행을 바꾸지 못하게 — 외부 공시 본문에 심긴 지시가 닿는 경로다 */
+const chatOnly = (what) => {
+  if (!CHAT) throw new Error(`자동 실행에서는 ${what} 할 수 없다 — 사용자가 대화(sss)에서 한다`);
+};
 mkdirSync(dirname(CALL_LOG), { recursive: true });
 
 // 라이선스상 opt-in 이 필요한 시세 소스는 모델이 아니라 사용자 설정(.env)으로만 켠다 — 도구 인자로 노출하지 않는다.
@@ -226,6 +249,116 @@ server.registerTool(
   handler('proposal_resolve', async (args) => {
     if (MODE === 'exec') throw new Error('자동 실행에서는 제안을 처리하지 않는다 — 사용자가 대화(sss)에서 결정한다');
     return resolveProposal(WIKI_DIR, args);
+  }),
+);
+
+// ── 운영: 상태 · 예약 · 실행 · 모델 — CLI 와 같은 일을 대화로 (PLAN.md "모든 조작은 대화로") ──
+const tail = (file, n) => (existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').slice(-n) : []);
+
+server.registerTool(
+  'system_status',
+  {
+    description:
+      '에이전트 운영 상태: 아침 브리핑 예약(시각)·실행 중 여부·마지막 브리핑·최근 로그, 용도별 모델(지금 값·기본값·목록 대조), ' +
+      '데이터 키 설정 여부(값은 주지 않는다), 대기 중 제안 수. "상태 점검해줘", "브리핑 예약돼 있어?", "무슨 모델 써?" 같은 질문에.',
+    inputSchema: {},
+  },
+  handler('system_status', async () => {
+    const state = readState(WIKI_DIR);
+    const set = (k) => !!process.env[k];
+    return {
+      wiki: WIKI_DIR,
+      schedule: scheduleStatus(),
+      briefing: {
+        running: runningBriefing(VAR, WIKI_DIR),
+        last_date: state.last_date ?? null,
+        today_file: existsSync(join(WIKI_DIR, 'briefings', `${kstDate()}.md`)) ? `briefings/${kstDate()}.md` : null,
+        log_tail: tail(BRIEFING_LOG, 4),
+      },
+      // 저장된 값(= 예약 실행·다음 sss 가 쓰는 값). 이 셸의 일회성 환경 변수는 서버에 오지 않아 보이지 않는다
+      models: routeTable({ env: {}, catalog: codexModels() }),
+      this_session: process.env.SSS_ACTIVE ?? null,
+      keys: { DART_API_KEY: set('DART_API_KEY'), DATA_GO_KR_KEY: set('DATA_GO_KR_KEY'), EDGAR_UA: set('EDGAR_UA') },
+      pending_proposals: listProposals(WIKI_DIR, { status: 'pending', limit: 1 }).total,
+      notes: [
+        '키는 대화로 받지 않는다 — 사용자가 레포의 .env 에 직접 넣는다 (AGENTS.md §5)',
+        'chat·deep 모델을 바꾸면 다음 sss 실행부터 적용된다. 지금 대화(this_session)의 모델은 사용자가 /model 로 바꾼다',
+        '예약 시각은 이 맥의 현지 시각이다',
+      ],
+    };
+  }),
+);
+
+server.registerTool(
+  'briefing_schedule',
+  {
+    description:
+      '평일(월~금) 아침 브리핑 예약. install 은 등록하거나 시각을 바꾸고, uninstall 은 해제한다. 사용자가 시각을 확인한 뒤에만 호출한다. ' +
+      '시각을 말하지 않으면 07:30 을 제안하고 확인받는다. 자동 실행에서는 거부된다.',
+    inputSchema: {
+      action: z.enum(['install', 'uninstall']),
+      time: z.string().regex(TIME, 'HH:MM (24시간)').optional().describe('HH:MM, 이 맥의 현지 시각(한국에 있으면 KST). install 에만. 기본 07:30'),
+    },
+  },
+  handler('briefing_schedule', async ({ action, time }) => {
+    chatOnly('브리핑 예약을 바꿀');
+    if (action === 'uninstall') return uninstallSchedule();
+    return { ...installSchedule({ time, wiki: WIKI_DIR, script: SSS, repo: REPO, log: BRIEFING_LOG }), note: '맥이 잠자기 중이었으면 깨어날 때 한 번 돈다' };
+  }),
+);
+
+server.registerTool(
+  'briefing_run',
+  {
+    description:
+      '아침 브리핑을 지금 백그라운드로 돌린다 (1~3분, 구독 한도를 쓴다). 결과는 briefings/<날짜>.md (같은 날 두 번째면 -2.md) — 끝나면 macOS 알림이 뜨고, ' +
+      '사용자가 다시 물으면 그 파일을 읽어 답한다. since 로 수집 시작일을 넓힐 수 있고, no_llm 이면 모델 없이 원자료만. 사용자가 원할 때만 호출한다. 자동 실행에서는 거부된다.',
+    inputSchema: {
+      since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('YYYY-MM-DD — 생략하면 마지막 브리핑 이후'),
+      no_llm: z.boolean().default(false),
+    },
+  },
+  handler('briefing_run', async ({ since, no_llm }) => {
+    chatOnly('브리핑을 돌릴');
+    const running = runningBriefing(VAR, WIKI_DIR);
+    if (running) return { started: false, running, note: '이미 돌고 있다 — 끝나면 briefings/ 에 파일이 생긴다' };
+    mkdirSync(VAR, { recursive: true });
+    const fd = openSync(BRIEFING_LOG, 'a');
+    let child;
+    try {
+      // 분리된 프로세스라 대화를 끝내도 브리핑은 끝까지 돈다
+      child = spawn(process.execPath, [SSS, 'briefing', ...(since ? ['--since', since] : []), ...(no_llm ? ['--no-llm'] : [])], {
+        cwd: REPO, detached: true, stdio: ['ignore', fd, fd], env: { ...BASE_ENV, SSS_WIKI_DIR: WIKI_DIR },
+      });
+    } finally {
+      closeSync(fd);
+    }
+    // 띄우지 못하면(node 가 지워짐·fd 고갈) 'error' 이벤트가 온다 — 받지 않으면 서버가 죽어 대화의 도구가 전부 사라진다
+    child.on('error', (e) => appendFileSync(BRIEFING_LOG, `[briefing_run] 실행 실패: ${e.message}\n`));
+    if (!child.pid) return { started: false, error: '브리핑 프로세스를 띄우지 못했다 — 로그를 확인한다', log: BRIEFING_LOG };
+    child.unref();
+    return { started: true, pid: child.pid, date: kstDate(), log: BRIEFING_LOG };
+  }),
+);
+
+server.registerTool(
+  'model_settings',
+  {
+    description:
+      '용도별 모델·추론 강도를 바꾼다: chat(대화 리서치) · deep(판단 기록·복기, sss deep) · exec(비대화 실행) · briefing(아침 브리핑). ' +
+      '상위 모델·높은 강도는 품질이 오르지만 구독 한도를 빨리 쓴다 — 바꾸기 전에 그 점을 말하고 확인받는다. ' +
+      '쓸 수 있는 이름은 system_status 의 models 와 codex 목록 대조로 확인한다. reset 이면 기본값으로. 자동 실행에서는 거부된다.',
+    inputSchema: {
+      route: z.enum(Object.keys(ROUTES)),
+      model: z.string().regex(/^[A-Za-z0-9._-]+$/).optional(),
+      effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional(),
+      reset: z.boolean().default(false),
+    },
+  },
+  handler('model_settings', async (args) => {
+    chatOnly('모델 설정을 바꿀');
+    const out = updateRoute(args);
+    return { ...out, applies: ['chat', 'deep'].includes(args.route) ? '다음 sss 실행부터 (지금 대화는 /model 로)' : '다음 실행부터' };
   }),
 );
 

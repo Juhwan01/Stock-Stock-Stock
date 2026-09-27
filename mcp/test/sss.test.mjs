@@ -1,11 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { delimiter, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { disableArgs, isolationArgs, checkIsolation, integrityProblems, childEnv, plistXml, DISABLED_FEATURES, WRITE_TOOLS, LABEL } from '../../bin/sss.mjs';
+import { disableArgs, isolationArgs, checkIsolation, integrityProblems, childEnv, briefingModelArgs, passthroughProblem, DISABLED_FEATURES, WRITE_TOOLS } from '../../bin/sss.mjs';
+import { modelArgs, resolveRoute, ROUTES } from '../lib/models.mjs';
+import { plistXml, LABEL } from '../lib/schedule.mjs';
+import { acquireRunLock } from '../lib/briefing.mjs';
 
 const SSS = fileURLToPath(new URL('../../bin/sss.mjs', import.meta.url));
 const SERVERS = [
@@ -135,7 +138,7 @@ test('init — 제안 대기열 폴더와, 브리핑 원자료·상태를 이력
 
 const brief = (dir, ...args) => spawnSync(process.execPath, [SSS, 'briefing', ...args], {
   // 키 파일을 비워 실제 키·네트워크 없이 돈다
-  env: { ...process.env, SSS_WIKI_DIR: dir, SSS_NO_NOTIFY: '1', SSS_ENV_FILE: join(dir, 'no.env') }, encoding: 'utf8',
+  env: { ...process.env, SSS_WIKI_DIR: dir, SSS_NO_NOTIFY: '1', SSS_ENV_FILE: join(dir, 'no.env'), SSS_VAR_DIR: join(dir, '.var') }, encoding: 'utf8',
 });
 
 test('briefing — 종목이 없으면 모델을 부르지 않고 등록 안내 브리핑을 남긴다', () => {
@@ -219,4 +222,146 @@ test('briefing — 미래 날짜는 거부한다 (마지막 브리핑 날짜로 
   assert.match(r.stderr, /오늘.*보다 늦다/);
   assert.ok(!existsSync(join(dir, 'briefings', '.state.json')));
   assert.deepEqual(readdirSync(join(dir, 'briefings')), [], '실패 보고 파일도 남기지 않는다 — 그날 아침 브리핑이 -2 로 밀린다');
+});
+
+// 이 셸에 모델 덮어쓰기가 export 돼 있어도 테스트가 흔들리지 않게
+const cleanEnv = (extra = {}) => ({
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^SSS_(CHAT|DEEP|EXEC|BRIEFING)_(MODEL|EFFORT)$/.test(k))),
+  ...extra,
+});
+
+test('용도별 모델 — 최상위 모델은 판단 기록·복기에만, 브리핑·exec 는 경량', () => {
+  const top = Object.entries(ROUTES).filter(([, r]) => r.model === ROUTES.deep.model).map(([k]) => k);
+  assert.deepEqual(top, ['deep'], '기본값이 전부 최상위면 구독 한도를 다 쓴다');
+  assert.notEqual(ROUTES.briefing.model, ROUTES.chat.model);
+  for (const r of Object.values(ROUTES)) assert.ok(r.model && r.effort && r.what);
+});
+
+test('용도별 모델 — 환경 변수 > 대화에서 저장한 설정 > 기본값, 빈 값은 무시', () => {
+  const settings = { models: { briefing: { model: 's1' }, deep: { effort: 'xhigh' } } };
+  assert.deepEqual(resolveRoute('chat', { env: {}, settings }), { model: ROUTES.chat.model, effort: ROUTES.chat.effort, source: 'default' });
+  assert.deepEqual(resolveRoute('briefing', { env: {}, settings }), { model: 's1', effort: ROUTES.briefing.effort, source: 'settings' });
+  assert.deepEqual(resolveRoute('briefing', { env: { SSS_BRIEFING_MODEL: 'e1', SSS_CHAT_MODEL: 'x' }, settings }), { model: 'e1', effort: ROUTES.briefing.effort, source: 'env' });
+  assert.equal(resolveRoute('deep', { env: { SSS_DEEP_MODEL: '' }, settings }).model, ROUTES.deep.model);
+  assert.equal(resolveRoute('deep', { env: {}, settings }).effort, 'xhigh');
+});
+
+test('용도별 모델 — 사용자가 codex 인자로 모델을 고르면 덮지 않는다 (붙여 쓴 형태 포함, -- 뒤는 프롬프트)', () => {
+  const r = { model: 'm', effort: 'low' };
+  const both = ['-m', 'm', '-c', 'model_reasoning_effort="low"'];
+  assert.deepEqual(modelArgs(r), both);
+  // 모델을 직접 골랐으면 강도도 그 모델 기본값에 맡긴다 — 용도의 강도를 그 모델이 지원하지 않을 수 있다
+  for (const user of [['-m', 'x'], ['-mx'], ['-m=x'], ['--model', 'x'], ['--model=x'], ['-c', 'model="x"'], ['-c', ' model="x"'], ['-cmodel="x"'], ['-c=model=x'], ['--config', 'model=x'], ['--config=model="x"']]) {
+    assert.deepEqual(modelArgs(r, user), [], user.join(' '));
+  }
+  assert.deepEqual(modelArgs(r, ['-c', 'model_reasoning_effort="high"']), ['-m', 'm']);
+  assert.deepEqual(modelArgs(r, ['-c', 'model_provider="x"']), both, 'model 로 시작하는 다른 키는 무관');
+  assert.deepEqual(modelArgs(r, ['--', '-m']), both, '-- 뒤는 프롬프트');
+});
+
+test('브리핑 모델 — 브리핑 용도 값을 쓰고, --model 이 이기며 그때 강도는 모델 기본값', () => {
+  const opts = (env = {}, settings = {}) => ({ env, settings });
+  assert.deepEqual(briefingModelArgs([], opts()), ['-m', ROUTES.briefing.model, '-c', `model_reasoning_effort="${ROUTES.briefing.effort}"`]);
+  assert.deepEqual(briefingModelArgs([], opts({}, { models: { briefing: { model: 'b', effort: 'low' } } })), ['-m', 'b', '-c', 'model_reasoning_effort="low"']);
+  assert.deepEqual(briefingModelArgs([], opts({ SSS_BRIEFING_EFFORT: 'high', SSS_EXEC_MODEL: 'no' })).slice(0, 4), ['-m', ROUTES.briefing.model, '-c', 'model_reasoning_effort="high"']);
+  assert.deepEqual(briefingModelArgs(['--model', 'x'], opts()), ['-m', 'x']);
+  assert.deepEqual(briefingModelArgs(['--model=x'], opts()), ['-m', 'x']);
+});
+
+test('codex 하위 명령은 대화 격리를 물려받지 않아 넘기지 않는다 — 이어가기(resume·fork)와 -- 뒤 프롬프트는 된다', () => {
+  for (const a of [['e', 'hi'], ['exec', 'hi'], ['-m', 'x', 'review'], ['sandbox', 'sh'], ['mcp', 'list']]) assert.match(passthroughProblem(a), /하위 명령/, a.join(' '));
+  for (const a of [[], ['resume', '--last'], ['fork'], ['삼성전자 공시 알려줘'], ['--', 'review']]) assert.equal(passthroughProblem(a), null, a.join(' '));
+});
+
+test('실행기가 codex 에 용도별 모델을 실제로 넘긴다 · 첫 실행에 위키를 만든다 (가짜 codex — 모델 호출 없음)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-route-'));
+  const bin = join(dir, 'bin');
+  const wiki = join(dir, 'wiki');
+  const argvFile = join(dir, 'argv.json');
+  spawnSync('mkdir', [bin]);
+  // 격리 점검(mcp list)에는 sss 만 켜진 목록으로 답하고, 실행은 인자만 적어 둔다
+  writeFileSync(join(bin, 'codex'), `#!${process.execPath}
+const a = process.argv.slice(2);
+if (a[0] === 'mcp') { console.log(JSON.stringify([{ name: 'sss', enabled: true }])); process.exit(0); }
+require('node:fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(a));
+`);
+  chmodSync(join(bin, 'codex'), 0o755);
+  const spawnSss = (args, extra = {}) => {
+    rmSync(argvFile, { force: true });
+    return spawnSync(process.execPath, [SSS, ...args], {
+      env: cleanEnv({ PATH: `${bin}${delimiter}${process.env.PATH}`, SSS_WIKI_DIR: wiki, SSS_ENV_FILE: join(dir, 'no.env'), SSS_VAR_DIR: join(dir, 'var'), ...extra }), encoding: 'utf8',
+    });
+  };
+  const run = (args, extra) => {
+    const r = spawnSss(args, extra);
+    assert.equal(r.status, 0, r.stderr);
+    const a = JSON.parse(readFileSync(argvFile, 'utf8'));
+    return { a, m: pairs(a, '-m'), effort: pairs(a, '-c').filter((c) => c.startsWith('model_reasoning_effort=')) };
+  };
+
+  const chat = run([]);
+  assert.deepEqual(integrityProblems(wiki), [], '위키가 없으면 첫 실행에 만든다');
+  assert.deepEqual([chat.m, chat.effort], [[ROUTES.chat.model], [`model_reasoning_effort="${ROUTES.chat.effort}"`]]);
+  assert.ok(pairs(chat.a, '-c').includes(`mcp_servers.sss.env.SSS_ACTIVE="chat · ${ROUTES.chat.model} · ${ROUTES.chat.effort}"`), '서버가 지금 대화의 모델을 안다');
+  const deep = run(['deep']);
+  assert.deepEqual([deep.m, deep.effort], [[ROUTES.deep.model], [`model_reasoning_effort="${ROUTES.deep.effort}"`]]);
+  assert.ok(!deep.a.includes('deep'), '하위 명령 이름을 프롬프트로 넘기지 않는다');
+  const exec = run(['exec', 'hi']);
+  assert.equal(exec.a[0], 'exec');
+  assert.deepEqual([exec.m, exec.a.at(-1)], [[ROUTES.exec.model], 'hi']);
+  // 대화(model_settings)에서 저장한 값을 쓰고, 환경 변수가 그보다 우선한다
+  spawnSync('mkdir', ['-p', join(dir, 'var')]);
+  writeFileSync(join(dir, 'var', 'settings.json'), JSON.stringify({ models: { exec: { model: 'saved', effort: 'low' } } }));
+  assert.deepEqual(run(['exec', 'hi']).m, ['saved']);
+  assert.deepEqual(run(['exec', 'hi'], { SSS_EXEC_MODEL: 'env-model' }).m, ['env-model']);
+  const mine = run(['exec', '-m', 'mine', 'hi']);
+  assert.deepEqual([mine.m, mine.effort], [['mine'], []], '사용자의 -m 이 이기고, -m 이 두 번 가지 않는다');
+
+  const e = spawnSss(['e', 'hi']);
+  assert.equal(e.status, 2);
+  assert.match(e.stderr, /하위 명령/);
+  assert.ok(!existsSync(argvFile), 'codex 를 띄우지 않는다');
+
+  // 일부만 있는 위키는 자동으로 고치지 않는다 — 규칙 링크가 지워진 흔적일 수 있다
+  rmSync(join(wiki, 'AGENTS.md'));
+  const tampered = spawnSss([]);
+  assert.equal(tampered.status, 2);
+  assert.ok(!existsSync(argvFile));
+});
+
+test('briefing — 같은 위키의 브리핑이 이미 돌고 있으면 실패 보고 파일로 그 자리를 차지하지 않는다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief-lock-'));
+  init(dir);
+  const release = acquireRunLock(join(dir, '.var'), dir);
+  try {
+    const r = brief(dir, '--date', '2026-09-22');
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /이미 실행 중/);
+    assert.deepEqual(readdirSync(join(dir, 'briefings')), []);
+  } finally {
+    release();
+  }
+  assert.equal(brief(dir, '--date', '2026-09-22').status, 0, '풀리면 돈다');
+});
+
+test('briefing — 수집만 보는 --dry-run 은 다른 브리핑이 돌고 있어도 된다 (아무것도 쓰지 않는다)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief-dry-'));
+  init(dir);
+  const release = acquireRunLock(join(dir, '.var'), dir);
+  try {
+    const r = brief(dir, '--dry-run');
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(readdirSync(join(dir, 'briefings')), []);
+  } finally {
+    release();
+  }
+});
+
+test('briefing — 잠금을 못 잡는 다른 이유(var/ 에 못 씀)는 실패 보고를 남긴다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief-var-'));
+  init(dir);
+  writeFileSync(join(dir, '.var'), '디렉터리가 아니라 파일'); // mkdir 이 실패한다
+  const r = brief(dir, '--date', '2026-09-22');
+  assert.equal(r.status, 1);
+  assert.match(readFileSync(join(dir, 'briefings', '2026-09-22.md'), 'utf8'), /error: true/);
 });
