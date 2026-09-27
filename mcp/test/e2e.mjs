@@ -1,5 +1,5 @@
 /**
- * E2E — 실제 Codex(ChatGPT 구독)로 bin/sss 를 띄워 에이전트를 확인한다. LLM 호출 5회.
+ * E2E — 실제 Codex(ChatGPT 구독)로 bin/sss 를 띄워 에이전트를 확인한다. LLM 호출 6회 (브리핑 포함).
  *
  * 판정은 모델의 자기보고가 아니라 결과물로 한다. 실행되지 않아도 통과하는 검사를 두지 않는다
  * (Phase 0 교훈 + 코드 리뷰 H4: exec 가 아예 안 떠도 "차단됨"으로 통과하던 검사가 있었다):
@@ -11,12 +11,13 @@
  * 실행: npm run test:e2e   (전제: codex 설치 + ChatGPT 로그인 + .env DART_API_KEY)
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isolationArgs, checkIsolation, listMcpServers } from '../../bin/sss.mjs';
 import { buildIndex, EDGE_RELS } from '../lib/wiki.mjs';
 import { today } from '../lib/decision.mjs';
+import { addDays } from '../lib/store.mjs';
 import { tempWiki } from './helpers.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -134,6 +135,35 @@ const tried = c.commands.find((x) => (x.command ?? '').includes('.e2e-probe'));
 check('에이전트 경유로도 코드 폴더에 파일이 생기지 않음', c.status === 0 && !existsSync(probe),
   tried ? `시도함 → exit ${tried.exit_code} ${(tried.aggregated_output ?? '').trim().slice(0, 50)}` : '모델이 실행하지 않음 (규칙에 따른 거부 — 샌드박스 증거는 위 두 항목)');
 rmSync(probe, { force: true });
+
+// ── 5. 아침 브리핑 (M2) — 코드가 모으고 모델이 분류한다. 자동 실행은 페이지를 쓰지 않고 제안만 남긴다 ──
+{
+  writeFileSync(join(WIKI, 'portfolio.yaml'), 'holdings:\n  - { market: KR, code: "000660", name: SK하이닉스, quantity: 10, avg_price: 200000 }\n');
+  const pagesBefore = new Set(readdirSync(PAGES));
+  const logBefore = logLines().length;
+  const t0 = Date.now();
+  const day = today();
+  const br = spawnSync(process.execPath, [SSS, 'briefing', '--since', addDays(day, -14)], {
+    env: { ...env, SSS_NO_NOTIFY: '1' }, cwd: REPO, encoding: 'utf8', timeout: 1_200_000, maxBuffer: 64 << 20,
+  });
+  const calls = logLines().slice(logBefore).map((l) => JSON.parse(l)).filter((c) => c.wiki === WIKI);
+  console.log(`\n▸ 아침 브리핑: exit ${br.status} · ${((Date.now() - t0) / 1000).toFixed(1)}s · sss 호출 ${calls.map((c) => `${c.tool}${c.ok ? '' : '✗'}`).join(', ') || '없음'}`);
+  const path = join(WIKI, 'briefings', `${day}.md`);
+  const md = existsSync(path) ? readFileSync(path, 'utf8') : '';
+  const inbox = JSON.parse(readFileSync(join(WIKI, 'briefings', `.inbox-${day}.json`), 'utf8'));
+  check('브리핑 정상 종료 + 원자료에 새 항목이 있음 (없으면 모델을 부르지 않아 아래 검사가 무의미)', br.status === 0 && inbox.items.length > 0, `새 항목 ${inbox.items.length}`);
+  check('모델이 쓴 브리핑 — 원자료만 남긴 대체 브리핑이 아님', md && !/fallback: true/.test(md) && /^counts:/m.test(md), md.split('\n').find((l) => l.startsWith('counts:')) ?? '파일 없음');
+  check('briefing_inbox 로 원자료를 읽음 (서버 호출 기록)', calls.some((c) => c.tool === 'briefing_inbox' && c.ok));
+  // 실행기가 빠진 항목을 "누락" 절로 채우므로 링크 존재만 보면 항상 통과한다 — 모델이 스스로 다 분류했는지를 본다
+  const patched = md.match(/모델이 분류하지 않은 항목 (\d+)건/)?.[1];
+  check('모델이 원자료를 빠짐없이 분류 (실행기의 누락 보충 없음)', !patched && inbox.items.every((i) => md.includes(i.url)), patched ? `누락 ${patched}건 보충됨` : `${inbox.items.length}건 전부`);
+  check('자동 실행은 위키 페이지를 만들거나 지우지 않음', readdirSync(PAGES).length === pagesBefore.size && readdirSync(PAGES).every((f) => pagesBefore.has(f)));
+  const adds = calls.filter((c) => c.tool === 'proposal_add' && c.ok);
+  const files = existsSync(join(WIKI, 'proposals')) ? readdirSync(join(WIKI, 'proposals')) : [];
+  check('제안은 대기열 파일로만 남고 5건을 넘지 않음', adds.length <= 5 && files.length === new Set(adds.map((c) => c.args.key)).size, `proposal_add ${adds.length}회 · 파일 ${files.length}`);
+  const state = JSON.parse(readFileSync(join(WIKI, 'briefings', '.state.json'), 'utf8'));
+  check('실린 항목은 다음 브리핑에서 빠지도록 상태에 남음', inbox.items.every((i) => state.seen[i.id]));
+}
 
 const passed = checks.filter(Boolean).length;
 console.log(`\n${'─'.repeat(50)}\nE2E: ${passed}/${checks.length} 통과`);

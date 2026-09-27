@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { disableArgs, isolationArgs, checkIsolation, integrityProblems, childEnv, DISABLED_FEATURES, WRITE_TOOLS } from '../../bin/sss.mjs';
+import { disableArgs, isolationArgs, checkIsolation, integrityProblems, childEnv, plistXml, DISABLED_FEATURES, WRITE_TOOLS, LABEL } from '../../bin/sss.mjs';
 
 const SSS = fileURLToPath(new URL('../../bin/sss.mjs', import.meta.url));
 const SERVERS = [
@@ -65,6 +65,15 @@ test('쓰기 도구 — 대화형은 사용자 승인, exec 는 기본 거부, �
   }
 });
 
+test('보유·관심 종목 쓰기도 승인 대상이고, 서버는 자동 실행 여부를 안다', () => {
+  assert.ok(WRITE_TOOLS.includes('watchlist_update') && WRITE_TOOLS.includes('holdings_update'));
+  assert.ok(!WRITE_TOOLS.includes('proposal_add'), '브리핑(exec)이 제안을 남길 수 있어야 한다');
+  assert.ok(WRITE_TOOLS.includes('proposal_resolve'), '대화형에서 제안 처리도 승인 화면을 거친다');
+  assert.deepEqual(pairs(isolationArgs({ wiki: '/w', mode: 'exec', sandbox: 'read-only' }), '-s'), ['read-only'], '브리핑은 읽기 전용');
+  assert.ok(pairs(isolationArgs({ wiki: '/w', mode: 'exec' }), '-c').includes('mcp_servers.sss.env.SSS_MODE="exec"'));
+  assert.ok(pairs(isolationArgs({ wiki: '/w' }), '-c').includes('mcp_servers.sss.env.SSS_MODE="chat"'));
+});
+
 test('사전 점검 — 격리 인자를 넣은 목록에서 sss 하나만 켜져야 통과한다', () => {
   const args = isolationArgs({ wiki: '/w', servers: SERVERS });
   // 가짜 목록: 넘겨받은 -c 인자를 실제 Codex 처럼 적용한다
@@ -115,4 +124,99 @@ test('에이전트가 규칙을 바꾼 흔적이 있으면 띄우지 않고, ini
   const kept = readdirSync(dir).filter((f) => /\.(replaced|disabled)-/.test(f));
   assert.equal(kept.length, 2, '무엇을 바꿨는지 볼 수 있게 지우지 않고 남긴다');
   assert.deepEqual(integrityProblems(dir), []);
+});
+
+test('init — 제안 대기열 폴더와, 브리핑 원자료·상태를 이력에서 빼는 .gitignore 를 만든다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-init2-'));
+  init(dir);
+  assert.ok(existsSync(join(dir, 'proposals')));
+  assert.match(readFileSync(join(dir, '.gitignore'), 'utf8'), /briefings\/\.inbox-\*\.json/);
+});
+
+const brief = (dir, ...args) => spawnSync(process.execPath, [SSS, 'briefing', ...args], {
+  // 키 파일을 비워 실제 키·네트워크 없이 돈다
+  env: { ...process.env, SSS_WIKI_DIR: dir, SSS_NO_NOTIFY: '1', SSS_ENV_FILE: join(dir, 'no.env') }, encoding: 'utf8',
+});
+
+test('briefing — 종목이 없으면 모델을 부르지 않고 등록 안내 브리핑을 남긴다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief0-'));
+  init(dir);
+  const r = brief(dir, '--date', '2026-09-22');
+  assert.equal(r.status, 0, r.stderr);
+  const md = readFileSync(join(dir, 'briefings', '2026-09-22.md'), 'utf8');
+  assert.match(md, /fallback: true/);
+  assert.match(md, /관심종목 추가/);
+});
+
+test('briefing --no-llm — 수집 실패를 브리핑에 싣고, 상태를 남기고, 다시 돌면 이어서 잡는다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief1-'));
+  init(dir);
+  writeFileSync(join(dir, 'portfolio.yaml'), 'watchlist:\n  - { market: KR, code: "000660", name: SK하이닉스 }\n');
+  const r = brief(dir, '--date', '2026-09-22', '--since', '2026-09-21', '--no-llm');
+  assert.equal(r.status, 0, r.stderr);
+  const md = readFileSync(join(dir, 'briefings', '2026-09-22.md'), 'utf8');
+  assert.match(md, /^---\ndate: 2026-09-22/);
+  assert.match(md, /--no-llm/);
+  assert.match(md, /## 수집 공백\n\n- KR 전체: DART_API_KEY 미설정/, '조용히 비어 있지 않고 왜 비었는지 싣는다');
+  const state = JSON.parse(readFileSync(join(dir, 'briefings', '.state.json'), 'utf8'));
+  assert.equal(state.last_date, '2026-09-22');
+  const inbox = JSON.parse(readFileSync(join(dir, 'briefings', '.inbox-2026-09-22.json'), 'utf8'));
+  assert.equal(inbox.since, '2026-09-21');
+  assert.deepEqual(inbox.universe.map((u) => u.code), ['000660']);
+  assert.ok(inbox.items.every((i) => state.seen[i.id] === '2026-09-22'), '실린 항목은 다음 브리핑에서 빠진다');
+});
+
+test('briefing — 날짜 형식이 틀리면 아무것도 쓰지 않고 실패한다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief2-'));
+  init(dir);
+  const r = brief(dir, '--date', '9/28');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /YYYY-MM-DD/);
+  assert.deepEqual(readdirSync(join(dir, 'briefings')), []);
+});
+
+test('예약 plist — 평일 5일 지정 시각, 절대 경로 node, PATH·위키 경로 고정, 로그 파일', () => {
+  const x = plistXml({ node: '/n/node', script: '/r/bin/sss.mjs', wiki: '/r/wiki', path: '/c/bin:/usr/bin', time: '07:05', log: '/r/var/briefing.log', cwd: '/r' });
+  assert.match(x, new RegExp(`<string>${LABEL.replace(/\./g, '\\.')}</string>`));
+  assert.equal((x.match(/<key>Weekday<\/key>/g) ?? []).length, 5);
+  assert.ok(!/<integer>0<\/integer><key>Hour/.test(x) && !/Weekday<\/key><integer>[06]</.test(x), '주말 없음');
+  assert.match(x, /<key>Hour<\/key><integer>7<\/integer><key>Minute<\/key><integer>5<\/integer>/);
+  assert.match(x, /<string>\/n\/node<\/string>\s*<string>\/r\/bin\/sss\.mjs<\/string>\s*<string>briefing<\/string>/);
+  assert.match(x, /<key>SSS_WIKI_DIR<\/key><string>\/r\/wiki<\/string>/);
+  assert.match(x, /<key>StandardOutPath<\/key><string>\/r\/var\/briefing\.log<\/string>/);
+  assert.match(plistXml({ node: '/a&b', script: 's', wiki: 'w', path: 'p', time: '07:00', log: 'l', cwd: 'c' }), /\/a&amp;b/, 'XML 이스케이프');
+});
+
+test('briefing — 포트폴리오가 깨져 있으면 실패하지만, 아침에 볼 수 있게 이유를 브리핑 파일로 남긴다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief3-'));
+  init(dir);
+  writeFileSync(join(dir, 'portfolio.yaml'), 'holdings:\n  - market: KR\n    code: 000660\n    name: x\n    quantity: 1\n    avg_price: 1\n');
+  const r = brief(dir, '--date', '2026-09-22');
+  assert.equal(r.status, 1);
+  const md = readFileSync(join(dir, 'briefings', '2026-09-22.md'), 'utf8');
+  assert.match(md, /error: true/);
+  assert.match(md, /6자리/);
+});
+
+test('briefing — 같은 날 다시 돌았는데 새 항목이 없으면 아침 브리핑을 덮어쓰지 않는다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief4-'));
+  init(dir);
+  writeFileSync(join(dir, 'portfolio.yaml'), 'watchlist:\n  - { market: KR, code: "000660", name: SK하이닉스 }\n');
+  writeFileSync(join(dir, 'briefings', '2026-09-22.md'), '# 모델이 쓴 아침 브리핑\n');
+  const r = brief(dir, '--date', '2026-09-22');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /새로 쓰지 않는다/);
+  assert.equal(readFileSync(join(dir, 'briefings', '2026-09-22.md'), 'utf8'), '# 모델이 쓴 아침 브리핑\n');
+  assert.deepEqual(readdirSync(join(dir, 'briefings')).filter((f) => f.endsWith('.md')), ['2026-09-22.md']);
+  assert.ok(!existsSync(join(dir, 'briefings', '.inbox-2026-09-22.json')), '아침 원자료도 덮어쓰지 않는다');
+});
+
+test('briefing — 미래 날짜는 거부한다 (마지막 브리핑 날짜로 남아 이후 수집을 망가뜨린다)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-brief5-'));
+  init(dir);
+  const r = brief(dir, '--date', '2099-01-01');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /오늘.*보다 늦다/);
+  assert.ok(!existsSync(join(dir, 'briefings', '.state.json')));
+  assert.deepEqual(readdirSync(join(dir, 'briefings')), [], '실패 보고 파일도 남기지 않는다 — 그날 아침 브리핑이 -2 로 밀린다');
 });

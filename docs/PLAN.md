@@ -55,14 +55,16 @@
 ### 레포 구성
 
 ```
-bin/sss.mjs          ← 실행기: 격리 레시피를 적용해 codex / codex exec 를 wiki/ 에서 띄운다. init · doctor
-agent/AGENTS.md      ← 에이전트 규칙: 사실 규율, 제안→확인 후 쓰기, 페이지 스키마, 판단 기록, 키 취급
+bin/sss.mjs          ← 실행기: 격리 레시피를 적용해 codex / codex exec 를 wiki/ 에서 띄운다. init · doctor · briefing · schedule
+agent/AGENTS.md      ← 에이전트 규칙: 사실 규율, 제안→확인 후 쓰기, 페이지 스키마, 판단 기록, 키 취급, 비신뢰 입력, 보유·제안
+agent/BRIEFING.md    ← 아침 브리핑 지시 (sss briefing 이 codex exec 에 넘긴다)
 mcp/server.mjs       ← 도메인 도구 MCP 서버 (Codex 가 띄운다) · mcp/lib/ 위키·판단·EDGAR·시세 · mcp/test/
 wiki/                ← 데이터 정본 — 코드 레포에서 제외, 자체 git 저장소 (sss init 이 만든다)
   AGENTS.md          ←   agent/AGENTS.md 를 가리키는 링크 (Codex 가 작업 디렉터리에서 읽는다)
   pages/             ←   위키 페이지 (노드 하나당 파일 하나)
-  briefings/         ←   아침 브리핑 (M2)
-  (보유 원장)         ←   수량·평단·현금 — 저장 형식은 M2 에서 정한다 (개인 포지션이라 위키 쪽 private 저장소)
+  briefings/         ←   아침 브리핑 <날짜>.md + 원자료(.inbox-<날짜>.json)·상태(.state.json, git 제외)
+  proposals/         ←   제안 대기열 p-YYYYMMDD-NNN.md — 브리핑이 남기고 대화에서 처리 (M2)
+  portfolio.yaml     ←   워치리스트 + 보유 원장 — 도구로만 고친다 (M2)
 watch/               ← 상시 감시 프로그램 (M3) — LLM 없음, launchd 상주
 var/calls.jsonl      ← 도구 호출 기록 — 모델 자기보고와 무관한 감사 기록 (gitignore)
 .codex/config.toml   ← Phase 0 검증 스파이크 전용 (spikes/codex-runtime). 제품은 bin/sss 가 설정을 주입한다
@@ -200,12 +202,17 @@ actual_outcome / variance / lesson   # 결과가 아니라 프로세스를 평�
 
 > **진행 (2026-09-27)** — **M1 에이전트 골격 완료 + 독립 코드 리뷰 반영**: `bin/sss`(격리 실행기·init·doctor) · `agent/AGENTS.md` · MCP 도구 14개(위키 4 · 판단 2 · DART 4 · EDGAR 2 · 시세 2) · 단위 테스트 55 + 실제 Codex E2E 18/18.
 > 리뷰(High 4 · Medium 7)에서 고친 것: 서버가 링크를 따라 위키 밖에 쓰던 우회 · 틀린 엣지 하나로 위키 도구 전체가 죽던 문제 · 전역 MCP 서버 감지를 `codex mcp list --json` + 실행 전 사전 점검으로 교체 · 실행되지 않아도 통과하던 E2E 검사 · 에이전트의 규칙 파일 변조 감지 · 판단 기록 도구는 대화형에서 사용자 승인, 자동 실행에서 거부 · KST 날짜 · price_history 공식 전용.
+> **M2 완료 (2026-09-27)** — 워치리스트·보유 원장(`portfolio.yaml`, 체결 신고 시 평단은 서버 계산) · 제안 대기열(`proposals/`, 원자료 key 로 한 번만) · 아침 브리핑(`sss briefing`: 코드가 수집 → 새 항목 있을 때만 `codex exec` 분류 → 실패해도 원자료 브리핑) · `sss schedule`(launchd 평일) · 비신뢰 입력 규칙. MCP 도구 21개 · 단위 테스트 101 · 실제 Codex E2E 25/25. 실데이터 시험: 보유 1 + 관심 2 종목, 2주치 공시 17건 → 제안 1 · 참고 1 · 무시 15, 약 70초 · 2.9만 토큰.
+> 독립 코드 리뷰(High 1 · Medium 5 · Low 5 + 재검증 4)에서 고친 것: 모델이 빠뜨린 항목이 "실림"으로 처리돼 영영 사라지던 문제(→ 누락 절에 원자료 보충) · **무인 브리핑을 읽기 전용 샌드박스로** — 공시 본문에 심긴 지시가 보유 원장·페이지·상태를 고치지 못하게, 브리핑은 최종 답(`codex exec -o`)으로 받아 실행기가 쓴다 · 실행 중 `briefings/` 바꿔치기 · 상태 파일의 날짜 주입·미래 날짜 · DART 100건·EDGAR 40건에서 조용히 잘리던 수집 · 소수점 주식 부동소수 오차 · 같은 날 재실행이 원자료를 덮던 문제.
+> ⚠️ 리뷰 수정 후 E2E 재실행은 **ChatGPT 구독 5시간 한도 소진**으로 모델 호출 단계가 실패했다(17/22 — 실패 5건 모두 모델 미호출). 한도 소진 상황에서 브리핑이 원자료만으로 대체되는 경로는 실제로 확인됐다. **읽기 전용 + 최종 답 방식의 실모델 확인은 한도 회복 후 남은 일.** 교훈: E2E 1회 ≈ 모델 호출 6회 — 한 세션에 여러 번 돌리면 Plus 한도를 다 쓴다.
+> 브리핑에 **시세는 싣지 않는다** — 공식 일별 시세는 T+1 13시라 아침엔 이틀 전 값이고, 비공식 시세는 위키에 남기지 않는다(불변식). 시세는 M4 증권사 연결로 채운다. 뉴스(네이버 API)도 아직 없다 — M3 RSS 와 함께.
+>
 > **마일스톤 (2026-09-27 개정 — 정석 점검 + 실시간 격상, §8)**. 실제 위키는 아직 `sss init` 전이다.
 >
 > | | 범위 | 계좌 |
 > |---|---|---|
-> | **M2 (다음)** | 워치리스트 · **보유 원장**(수량·평단·현금, 수동 입력) · 아침 브리핑(launchd + `sss exec`, 보유 비중 순) · 대기 중 제안 저장 형식(SCENARIOS 공백 #9) · **비신뢰 입력 규칙**(`AGENTS.md`) | 불필요 |
-> | **M3** | **상시 감시 프로그램**(`watch/`, LLM 없음, launchd 상주) · **텔레그램 푸시** · DART 20초 폴링 + RSS · EDGAR `getcurrent` · 뉴스 RSS · 보유·관심 종목·열린 Decision 규칙 매칭 → 걸린 것만 `codex exec` 해석 *(Phase 2 장중 공시 감시를 당김)* | 불필요 |
+> | **M2 ✅** | 워치리스트 · **보유 원장**(수량·평단·현금, 수동 입력) · 아침 브리핑(launchd + `sss exec`, 보유 비중 순) · 대기 중 제안 저장 형식(SCENARIOS 공백 #9) · **비신뢰 입력 규칙**(`AGENTS.md`) | 불필요 |
+> | **M3 (다음)** | **상시 감시 프로그램**(`watch/`, LLM 없음, launchd 상주) · **텔레그램 푸시** · DART 20초 폴링 + RSS · EDGAR `getcurrent` · 뉴스 RSS · 보유·관심 종목·열린 Decision 규칙 매칭 → 걸린 것만 `codex exec` 해석 *(Phase 2 장중 공시 감시를 당김)* | 불필요 |
 > | **M4** | **멀티 증권사 어댑터** — 공통 인터페이스 + 토스 먼저, 이어서 키움 · KIS. WebSocket 시세(가격선·통계적 급변 감지) · 수급 · 증권사별 보유 합산 동기화 · 구독 슬롯 배분·장애 시 재구독 · IP 변경 감지 *(Phase 3 계좌 연결을 당김)* | 토스 (+ 키움 · KIS 선택) |
 > | 병행 | 콜드 스타트 백필 · 위키 git 자동 커밋 · 용도별 모델 *(기존 M3)* | 불필요 |
 >

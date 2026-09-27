@@ -166,12 +166,13 @@ export function createDart({ key = () => process.env.DART_API_KEY, cacheFile, fe
     },
 
     /** 공시 목록. 기본은 최근 90일 */
-    async filings(stockCode, { from = kstDay(-90), to = kstDay(), type, limit = 20, finalOnly = true } = {}) {
+    async filings(stockCode, { from = kstDay(-90), to = kstDay(), type, limit = 20, page = 1, finalOnly = true } = {}) {
       const corp = await corpOf(stockCode);
       const d = await json('list.json', {
         corp_code: corp.corp_code,
         bgn_de: from,
         end_de: to,
+        page_no: String(page),
         page_count: String(Math.min(limit, 100)),
         ...(type && { pblntf_ty: type }),
         ...(finalOnly && { last_reprt_at: 'Y' }),
