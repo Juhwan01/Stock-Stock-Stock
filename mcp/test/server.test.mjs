@@ -31,12 +31,13 @@ before(async () => {
 });
 after(() => client?.close());
 
-test('도구 목록 — 위키 4 · 판단 2 · 한국 공시 4 · 미국 공시 2 · 한국 시세 2', async () => {
+test('도구 목록 — 위키 4 · 판단 2 · 포트폴리오 3 · 브리핑·제안 4 · 한국 공시 4 · 미국 공시 2 · 한국 시세 2', async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
-    'dart_filing_text', 'dart_filings', 'dart_financials', 'decision_record', 'decision_update',
-    'find_company', 'find_similar_cases', 'price_history', 'quote',
-    'recent_filings', 'wiki_graph_query', 'wiki_search', 'wiki_status', 'xbrl_concept',
+    'briefing_inbox', 'dart_filing_text', 'dart_filings', 'dart_financials', 'decision_record', 'decision_update',
+    'find_company', 'find_similar_cases', 'holdings_update', 'portfolio_get', 'price_history',
+    'proposal_add', 'proposal_list', 'proposal_resolve', 'quote',
+    'recent_filings', 'watchlist_update', 'wiki_graph_query', 'wiki_search', 'wiki_status', 'xbrl_concept',
   ]);
 });
 
@@ -89,4 +90,45 @@ test('도구가 실행된 호출은 성공·실패 모두 호출 기록에 남�
   assert.ok(lines.every((l) => l.wiki === WIKI && Number.isInteger(l.pid)), '동시 세션을 가려낼 수 있게 위키 경로·pid 를 남긴다');
   assert.ok(lines.some((l) => l.tool === 'wiki_search' && l.ok));
   assert.ok(lines.some((l) => l.tool === 'decision_record' && !l.ok && /위키에 없는 노드: company-ghost/.test(l.error)));
+});
+
+test('MCP 로 보유를 적고 비중을 읽는다 — 위키 폴더의 portfolio.yaml 에 남는다', async () => {
+  const w = await call('holdings_update', {
+    positions: [{ market: 'KR', code: '000660', name: 'SK하이닉스', quantity: 10, avg_price: 200000 }],
+    cash: { KRW: 2000000 }, user_confirmed: true,
+  });
+  assert.equal(w.isError, false, w.text);
+  const p = JSON.parse((await call('portfolio_get')).text);
+  assert.equal(p.holdings[0].weight, 0.5);
+  assert.match(p.basis, /원가 기준/);
+  assert.match(readFileSync(join(WIKI, 'portfolio.yaml'), 'utf8'), /SK하이닉스/);
+});
+
+test('제안 대기열 — 대화형 서버에서는 추가·조회·처리가 된다', async () => {
+  const add = JSON.parse((await call('proposal_add', {
+    key: 'dart:20260918000123', kind: 'other', title: '테스트 제안입니다', reason: '열 글자 이상의 이유를 적는다',
+    sources: ['https://dart.fss.or.kr/x'],
+  })).text);
+  assert.equal(add.duplicate, false);
+  assert.equal(JSON.parse((await call('proposal_list')).text).total, 1);
+  const r = await call('proposal_resolve', { id: add.id, status: 'rejected', note: '테스트', user_confirmed: true });
+  assert.equal(r.isError, false, r.text);
+});
+
+test('자동 실행(SSS_MODE=exec) 서버는 제안 처리를 거부한다 — 사용자 결정을 대신하지 않는다', async () => {
+  const wiki = tempWiki();
+  const exec = new Client({ name: 'test-exec', version: '0.0.0' });
+  await exec.connect(new StdioClientTransport({
+    command: process.execPath, args: [SERVER],
+    env: { ...process.env, SSS_WIKI_DIR: wiki, SSS_CALL_LOG: CALL_LOG, SSS_MODE: 'exec' }, stderr: 'ignore',
+  }));
+  try {
+    const run = async (name, args) => (await exec.callTool({ name, arguments: args })).content[0].text;
+    const { id } = JSON.parse(await run('proposal_add', {
+      key: 'dart:1', kind: 'other', title: '자동 실행 제안', reason: '열 글자 이상의 이유를 적는다', sources: ['https://x.y/z'],
+    }));
+    assert.match(await run('proposal_resolve', { id, status: 'accepted', user_confirmed: true }), /자동 실행에서는 제안을 처리하지 않는다/);
+  } finally {
+    await exec.close();
+  }
 });

@@ -29,6 +29,7 @@ export async function recentFilings(ticker, limit = 5) {
   for (let i = 0; i < r.accessionNumber.length && filings.length < limit; i++) {
     const acc = r.accessionNumber[i];
     filings.push({
+      accession: acc,
       form: r.form[i],
       filed: r.filingDate[i],
       items: r.items[i] || null,
