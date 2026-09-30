@@ -34,8 +34,10 @@ const BEAT_MS = 10e3; // 이벤트 루프 박동 — 이 타이머가 GAP_MS 넘
 const STALE_MS = 3 * 60e3; // 이보다 오래 소식이 없으면 감시가 멈춘 것
 const BATCH_WAIT_MS = 60e3; // 해석은 잠깐 모았다가 한 번에
 const BATCH_MAX = 5;
-// DART 원문은 목록보다 늦게 열린다 (2026-09-30 실측) — 열릴 때까지 해석을 미루고, 너무 오래 안 열리면 해석을 건너뛴다
-const DOC_RECHECK_MS = 60e3; // 첫 재확인. 이후 2배씩 32분까지 — 두 시간에 8번 남짓
+// DART 원문은 목록보다 늦게 열린다 — 2026-09-30 실측: 새 공시 20건 모두 33~43분(중앙 39분) 뒤, 몇 분 사이에 한꺼번에 열렸다
+// (30~40분 주기로 묶어 여는 것으로 보인다). 열릴 때까지 해석을 미루고, 두 시간 넘게 안 열리면 건너뛴다
+const DOC_RECHECK_MS = 60e3; // 첫 재확인. 이후 2배씩 늘리되 5분을 넘기지 않는다 — 열린 뒤 5분 안에 잡는다(공시당 DART 10번 남짓)
+const DOC_RECHECK_MAX_MS = 5 * 60e3;
 const DOC_WAIT_MAX_MS = 120 * 60e3;
 const SWEEP_MAX = 40; // 시장마다 종목별 점검 상한 — 10분마다 종목당 DART 한 번
 const PUSH_EACH_MAX = 5; // 한 번에 이보다 많이 걸리면 한 통으로 묶는다
@@ -715,8 +717,8 @@ export function createWatcher({ root, varDir, env = {}, wiki, dart, edgar, fetch
         }
         if (ok) ready.push(a);
         else if (now() - a.queuedAt < DOC_WAIT_MAX_MS) {
-          const checks = (a.checks ?? 0) + 1; // 1·2·4·…·32분 — 안 열리는 원문에 DART 호출을 태우지 않게
-          waiting.push({ ...a, checks, nextCheckAt: now() + Math.min(DOC_RECHECK_MS * 2 ** (checks - 1), 32 * 60e3) });
+          const checks = (a.checks ?? 0) + 1; // 1·2·4·5·5…분
+          waiting.push({ ...a, checks, nextCheckAt: now() + Math.min(DOC_RECHECK_MS * 2 ** (checks - 1), DOC_RECHECK_MAX_MS) });
         }
         else {
           log(`원문이 ${DOC_WAIT_MAX_MS / 60e3}분 안에 열리지 않아 해석 건너뜀: ${a.name} — ${a.title} (아침 브리핑이 다룬다)`);

@@ -7,7 +7,7 @@ import { tempWiki } from './helpers.mjs';
 import { dartLatest, edgarCurrent, parseEdgarAtom, parseRss } from '../lib/feeds.mjs';
 import {
   acquireWatchLock, cadence, createWatcher, matchNews, queryAlerts, readRecords, readWatchState, requestStop, scrubLinks, updateWatchSettings, watchDigest,
-  watchSettings, watchStatus, watchTargets, WATCH_DEFAULTS,
+  watchSettings, watchTargets, WATCH_DEFAULTS,
 } from '../lib/watch.mjs';
 import { confirmLink, createTelegram, push, startLink, telegramStatus, unlink } from '../lib/telegram.mjs';
 import { readSettings } from '../lib/settings.mjs';
@@ -401,7 +401,7 @@ test('맥이 잠들면(박동 타이머가 늦게 옴) 공백으로 기록·알�
   sleep(45 * 60e3);
   await w.tick();
   assert.ok(sent.some((m) => m.title.includes('감시 공백') && m.silent));
-  assert.equal(watchStatus(ctx.varDir, { settings: {} }).today.gaps.length, 2);
+  assert.equal(readRecords(ctx.varDir, '2026-09-30').filter((r) => r.type === 'gap').length, 2); // 시험 날짜의 기록 — 실제 오늘과 무관하게
 });
 
 /** run() 을 한 바퀴만 — 첫 틱 뒤 멈춘다 */
