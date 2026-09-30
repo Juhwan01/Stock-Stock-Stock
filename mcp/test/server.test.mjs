@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,13 +45,13 @@ before(async () => {
 });
 after(() => client?.close());
 
-test('도구 목록 — 위키 4 · 판단 2 · 포트폴리오 3 · 브리핑·제안 4 · 운영 4 · 한국 공시 4 · 미국 공시 2 · 한국 시세 2', async () => {
+test('도구 목록 — 위키 4 · 판단 2 · 포트폴리오 3 · 브리핑·제안 4 · 운영 4 · 감시·텔레그램 3 · 한국 공시 4 · 미국 공시 2 · 한국 시세 2', async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
     'briefing_inbox', 'briefing_run', 'briefing_schedule', 'dart_filing_text', 'dart_filings', 'dart_financials', 'decision_record', 'decision_update',
     'find_company', 'find_similar_cases', 'holdings_update', 'model_settings', 'portfolio_get', 'price_history',
     'proposal_add', 'proposal_list', 'proposal_resolve', 'quote',
-    'recent_filings', 'system_status', 'watchlist_update', 'wiki_graph_query', 'wiki_search', 'wiki_status', 'xbrl_concept',
+    'recent_filings', 'system_status', 'telegram_link', 'watch_alerts', 'watch_control', 'watchlist_update', 'wiki_graph_query', 'wiki_search', 'wiki_status', 'xbrl_concept',
   ]);
 });
 
@@ -60,13 +60,14 @@ const AUTO_APPROVED = [
   'wiki_search', 'wiki_graph_query', 'find_similar_cases', 'wiki_status', 'portfolio_get', 'briefing_inbox', 'proposal_list', 'system_status',
   'find_company', 'dart_filings', 'dart_filing_text', 'dart_financials', 'recent_filings', 'xbrl_concept', 'quote', 'price_history',
   'proposal_add', // 쓰기지만 위키 페이지가 아니라 대기열 — 브리핑(exec)이 남겨야 한다
+  'watch_alerts', // 감시 기록 조회 — 감시 해석(exec)이 읽어야 한다
 ];
 test('모든 도구는 승인 대상(WRITE_TOOLS) 또는 명시된 자동 승인 목록 중 하나 — 판단·보유·운영을 바꾸는 도구는 승인 대상', async () => {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [...WRITE_TOOLS, ...AUTO_APPROVED].sort());
   assert.ok(!WRITE_TOOLS.some((t) => AUTO_APPROVED.includes(t)));
-  for (const t of ['briefing_schedule', 'briefing_run', 'model_settings', 'decision_record', 'holdings_update']) assert.ok(WRITE_TOOLS.includes(t), t);
+  for (const t of ['briefing_schedule', 'briefing_run', 'model_settings', 'decision_record', 'holdings_update', 'watch_control', 'telegram_link']) assert.ok(WRITE_TOOLS.includes(t), t);
 });
 
 test('운영 도구는 실행 모드를 모르면(SSS_MODE 없음) 막는다 — 실행기 밖에서 서버만 띄운 경우', async () => {
@@ -181,6 +182,10 @@ test('자동 실행(SSS_MODE=exec) 서버는 제안 처리를 거부한다 — �
     assert.match(await run('briefing_schedule', { action: 'uninstall' }), /자동 실행에서는/);
     assert.match(await run('briefing_run', {}), /자동 실행에서는/);
     assert.match(await run('model_settings', { route: 'briefing', model: 'gpt-6-astra' }), /자동 실행에서는/);
+    // 감시 해석도 무인 실행이다 — 공시 본문의 지시가 감시를 끄거나 알림을 딴 곳으로 돌리지 못하게
+    assert.match(await run('watch_control', { action: 'stop' }), /자동 실행에서는/);
+    assert.match(await run('watch_control', { action: 'configure', news: 'off', interpret: false }), /자동 실행에서는/);
+    assert.match(await run('telegram_link', { action: 'unlink' }), /자동 실행에서는/);
     assert.ok(!existsSync(join(OPS, 'LaunchAgents')) && !existsSync(join(VAR, 'settings.json')));
     assert.ok(!existsSync(join(wiki, 'briefings')) || readdirSync(join(wiki, 'briefings')).every((f) => !f.endsWith('.md')));
     assert.ok(JSON.parse(await run('system_status', {})).models, '상태 조회는 된다');
@@ -194,10 +199,74 @@ test('system_status — 예약·브리핑·모델·키 설정 여부를 보여�
   assert.equal(r.isError, false, r.text);
   const st = JSON.parse(r.text);
   assert.deepEqual(Object.keys(st.models[0]).sort(), ['default', 'effort', 'model', 'problem', 'route', 'source', 'what']);
-  assert.deepEqual(st.models.map((m) => m.route), ['chat', 'deep', 'exec', 'briefing']);
+  assert.deepEqual(st.models.map((m) => m.route), ['chat', 'deep', 'exec', 'briefing', 'watch']);
   assert.ok(Object.values(st.keys).every((v) => typeof v === 'boolean'), '값이 아니라 설정 여부만');
   assert.equal(st.schedule.registered, false);
   assert.equal(st.this_session, 'chat · test-model', '실행기가 알려준 지금 대화의 모델');
+  assert.equal(st.keys.TELEGRAM_BOT_TOKEN, false);
+  assert.deepEqual([st.watch.registered, st.watch.running], [false, false]);
+  assert.deepEqual(st.telegram, { token_set: false, linked: false, chat: null, linked_at: null, pending_link: null });
+});
+
+test('watch_control — 대화에서 켜기(상주 등록)·설정·끄기, 설정은 검사한다', async () => {
+  const on = JSON.parse((await call('watch_control', { action: 'start', news: 'all', llm_daily_cap: 3 })).text);
+  assert.deepEqual([on.settings.news, on.settings.llm_daily_cap], ['all', 3]);
+  assert.equal(on.status.registered, true);
+  assert.match(on.note, /기준선/);
+  assert.match(on.note, /macOS 알림/, '텔레그램이 없으면 그렇다고 말한다');
+  const plist = readFileSync(join(OPS, 'LaunchAgents', 'com.stock-stock-stock.watch.plist'), 'utf8');
+  assert.match(plist, /<string>watch<\/string>\s*<string>run<\/string>/);
+  assert.match(plist, new RegExp(`<key>SSS_WIKI_DIR</key><string>${WIKI}</string>`));
+  assert.equal((await call('watch_control', { action: 'configure', news: 'loud' })).isError, true);
+  assert.equal((await call('watch_control', { action: 'configure', llm_daily_cap: 99 })).isError, true);
+  const off = JSON.parse((await call('watch_control', { action: 'stop' })).text);
+  assert.equal(off.status.registered, false);
+  assert.equal(JSON.parse((await call('system_status')).text).watch.settings.news, 'all', '끄기는 설정을 지우지 않는다');
+});
+
+test('감시 해석(SSS_PURPOSE=watch) 서버는 제안 대기열도 쓰지 않는다 — 조회만', async () => {
+  const wiki = tempWiki();
+  const c = new Client({ name: 'test-watch', version: '0.0.0' });
+  await c.connect(new StdioClientTransport({
+    command: process.execPath, args: [SERVER],
+    env: { ...process.env, ...OPS_ENV, SSS_WIKI_DIR: wiki, SSS_CALL_LOG: CALL_LOG, SSS_MODE: 'exec', SSS_PURPOSE: 'watch' }, stderr: 'ignore',
+  }));
+  try {
+    const r = await c.callTool({ name: 'proposal_add', arguments: { key: 'dart:1', kind: 'other', title: '감시가 남긴 제안', reason: '열 글자 이상의 이유를 적는다', sources: ['https://x.y/z'] } });
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, /감시 해석은 제안을 남기지 않는다/);
+    assert.ok(!existsSync(join(wiki, 'proposals')) || !readdirSync(join(wiki, 'proposals')).length);
+    assert.ok(!(await c.callTool({ name: 'wiki_search', arguments: { q: 'HBM' } })).isError);
+  } finally {
+    await c.close();
+  }
+});
+
+test('telegram_link — 토큰이 없으면 발급 안내로 실패하고, 연결 전 시험 발송도 실패한다 (토큰은 대화로 받지 않는다)', async () => {
+  const r = await call('telegram_link', { action: 'start' });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /BotFather/);
+  assert.equal((await call('telegram_link', { action: 'test' })).isError, true);
+  const { tools } = await client.listTools();
+  assert.deepEqual(Object.keys(tools.find((t) => t.name === 'telegram_link').inputSchema.properties), ['action']);
+});
+
+test('watch_alerts — 감시 기록을 날짜·종류별로 읽고, 해석 묶음을 이름으로 찾는다', async () => {
+  const day = kstDate();
+  const dir = join(VAR, 'watch');
+  mkdirSync(dir, { recursive: true });
+  const rec = (r) => JSON.stringify({ at: new Date().toISOString(), ...r });
+  writeFileSync(join(dir, `alerts-${day}.jsonl`), [
+    rec({ type: 'alert', id: 'dart:1', kind: 'filing', name: 'SK하이닉스', title: '잠정실적', push: 'telegram' }),
+    rec({ type: 'alert', id: 'news:x', kind: 'news', name: 'SK하이닉스', title: '기사', push: 'none' }),
+    rec({ type: 'batch', batch: `${day}-101500`, ids: ['dart:1'] }),
+    rec({ type: 'interpretation', batch: `${day}-101500`, ok: true, text: '■ …' }),
+  ].join('\n') + '\n');
+  const all = JSON.parse((await call('watch_alerts')).text);
+  assert.deepEqual([all.total, all.pushed, all.interpretations.length], [2, 1, 1]);
+  assert.equal(JSON.parse((await call('watch_alerts', { kind: 'news' })).text).alerts[0].id, 'news:x');
+  assert.deepEqual(JSON.parse((await call('watch_alerts', { batch: `${day}-101500` })).text).items.map((i) => i.id), ['dart:1']);
+  assert.equal((await call('watch_alerts', { batch: '../../etc' })).isError, true);
 });
 
 test('briefing_schedule — 대화에서 예약·시각 변경·해제, system_status 에 반영', async () => {
@@ -215,7 +284,9 @@ test('briefing_schedule — 대화에서 예약·시각 변경·해제, system_s
 test('model_settings — 목록에 없는 모델은 저장하지 않는다', async () => {
   const r = await call('model_settings', { route: 'briefing', model: 'gpt-nonexistent-9' });
   assert.equal(r.isError, true);
-  assert.ok(!existsSync(join(VAR, 'settings.json')));
+  // 감시 설정은 앞 테스트가 남겼을 수 있다 — 모델 설정만 본다
+  const saved = existsSync(join(VAR, 'settings.json')) ? JSON.parse(readFileSync(join(VAR, 'settings.json'), 'utf8')) : {};
+  assert.equal(saved.models?.briefing, undefined);
   assert.equal((await call('model_settings', { route: 'chat', effort: 'turbo' })).isError, true, '강도는 정해진 값만');
 });
 

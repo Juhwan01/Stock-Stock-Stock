@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readSettings, resolveRoute, routeProblem, routeTable, updateRoute, ROUTES } from '../lib/models.mjs';
-import { installSchedule, scheduleStatus, uninstallSchedule, LABEL } from '../lib/schedule.mjs';
+import { installSchedule, installWatch, scheduleStatus, uninstallSchedule, uninstallWatch, watchAgentStatus, watchPlistXml, LABEL, WATCH_LABEL } from '../lib/schedule.mjs';
 import { acquireRunLock, runningBriefing } from '../lib/briefing.mjs';
 
 const tmp = (p) => mkdtempSync(join(tmpdir(), p));
@@ -92,6 +92,28 @@ test('예약 — 시각 형식이 틀리면 아무것도 쓰지 않는다', () =
   }
   assert.ok(!existsSync(f.agents));
   assert.deepEqual(f.calls(), []);
+});
+
+test('상시 감시 등록 — 로그인 때 뜨고 죽으면 다시 뜨는 에이전트, 브리핑 예약과 따로 논다', () => {
+  const f = fakeLaunchd();
+  const log = join(tmp('sss-wlog-'), 'watch.launchd.log');
+  assert.deepEqual(watchAgentStatus(f.opts), { registered: false, plist: null });
+  const r = installWatch({ wiki: '/r/wiki', script: '/r/bin/sss.mjs', repo: '/r', log }, f.opts);
+  const xml = readFileSync(r.plist, 'utf8');
+  assert.match(xml, new RegExp(`<string>${WATCH_LABEL}</string>`));
+  assert.match(xml, /<key>RunAtLoad<\/key><true\/>/);
+  assert.match(xml, /<key>KeepAlive<\/key><true\/>/);
+  assert.match(xml, /<string>watch<\/string>\s*<string>run<\/string>/);
+  assert.ok(!xml.includes('StartCalendarInterval'), '상주 — 시각 예약이 아니다');
+  assert.equal(watchAgentStatus(f.opts).registered, true);
+  assert.equal(scheduleStatus(f.opts).plist, null, '브리핑 예약은 건드리지 않는다');
+  assert.deepEqual(uninstallWatch(f.opts), { registered: false, removed: true });
+  assert.equal(watchAgentStatus(f.opts).registered, false);
+});
+
+test('감시 plist — 경로의 특수문자를 XML 로 이스케이프한다', () => {
+  const xml = watchPlistXml({ node: '/n', script: '/a&b/<s>.mjs', wiki: '/w', path: '/bin', log: '/l', cwd: '/c' });
+  assert.match(xml, /\/a&amp;b\/&lt;s&gt;\.mjs/);
 });
 
 // ── 실행 잠금 ─────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { delimiter, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { disableArgs, isolationArgs, checkIsolation, integrityProblems, childEnv, briefingModelArgs, passthroughProblem, DISABLED_FEATURES, WRITE_TOOLS } from '../../bin/sss.mjs';
+import { disableArgs, isolationArgs, checkIsolation, integrityProblems, childEnv, briefingModelArgs, passthroughProblem, watchModelArgs, DISABLED_FEATURES, WRITE_TOOLS } from '../../bin/sss.mjs';
 import { modelArgs, resolveRoute, ROUTES } from '../lib/models.mjs';
 import { plistXml, LABEL } from '../lib/schedule.mjs';
 import { acquireRunLock } from '../lib/briefing.mjs';
@@ -226,7 +226,7 @@ test('briefing — 미래 날짜는 거부한다 (마지막 브리핑 날짜로 
 
 // 이 셸에 모델 덮어쓰기가 export 돼 있어도 테스트가 흔들리지 않게
 const cleanEnv = (extra = {}) => ({
-  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^SSS_(CHAT|DEEP|EXEC|BRIEFING)_(MODEL|EFFORT)$/.test(k))),
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^SSS_(CHAT|DEEP|EXEC|BRIEFING|WATCH)_(MODEL|EFFORT)$/.test(k))),
   ...extra,
 });
 
@@ -235,6 +235,29 @@ test('용도별 모델 — 최상위 모델은 판단 기록·복기에만, 브�
   assert.deepEqual(top, ['deep'], '기본값이 전부 최상위면 구독 한도를 다 쓴다');
   assert.notEqual(ROUTES.briefing.model, ROUTES.chat.model);
   for (const r of Object.values(ROUTES)) assert.ok(r.model && r.effort && r.what);
+});
+
+test('감시 해석 모델 — 경량 모델·낮은 강도가 기본이고, 대화에서 바꾼 값을 따른다', () => {
+  assert.deepEqual(watchModelArgs({ env: {}, settings: {} }), ['-m', ROUTES.watch.model, '-c', `model_reasoning_effort="${ROUTES.watch.effort}"`]);
+  assert.equal(ROUTES.watch.effort, 'low', '장중에 여러 번 돈다');
+  assert.deepEqual(watchModelArgs({ env: {}, settings: { models: { watch: { model: 'w', effort: 'medium' } } } }), ['-m', 'w', '-c', 'model_reasoning_effort="medium"']);
+});
+
+test('sss watch — 종목이 없으면 아무 데도 요청하지 않고 한 바퀴 돈다 · 상태·텔레그램 상태는 모델·네트워크 없이 나온다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sss-watchcli-'));
+  const env = { ...process.env, SSS_WIKI_DIR: join(dir, 'wiki'), SSS_VAR_DIR: join(dir, 'var'), SSS_ENV_FILE: join(dir, 'no.env'), SSS_NO_NOTIFY: '1',
+    SSS_LAUNCHD_DIR: join(dir, 'LaunchAgents'), SSS_LAUNCHCTL: '/usr/bin/false' };
+  const once = spawnSync(process.execPath, [SSS, 'watch', 'once'], { env, encoding: 'utf8' });
+  assert.equal(once.status, 0, once.stderr);
+  assert.deepEqual(JSON.parse(once.stdout.slice(once.stdout.indexOf('{'))), { sources: {}, targets: { KR: 0, US: 0 } });
+  const st = spawnSync(process.execPath, [SSS, 'watch', 'status'], { env, encoding: 'utf8' });
+  assert.equal(st.status, 0, st.stderr);
+  const status = JSON.parse(st.stdout.slice(0, st.stdout.indexOf('\n}') + 2));
+  assert.equal(status.registered, false);
+  assert.equal(status.telegram.token_set, false);
+  const tg = spawnSync(process.execPath, [SSS, 'telegram', 'test'], { env, encoding: 'utf8' });
+  assert.equal(tg.status, 1);
+  assert.match(tg.stderr, /텔레그램으로 못 보냄/);
 });
 
 test('용도별 모델 — 환경 변수 > 대화에서 저장한 설정 > 기본값, 빈 값은 무시', () => {

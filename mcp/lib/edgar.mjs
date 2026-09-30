@@ -6,14 +6,14 @@ const UA = () => process.env.EDGAR_UA ?? 'Stock-Stock-Stock-personal-research co
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function edgar(url) {
-  const res = await fetch(url, { headers: { 'User-Agent': UA(), 'Accept-Encoding': 'gzip, deflate' } });
+  const res = await fetch(url, { headers: { 'User-Agent': UA(), 'Accept-Encoding': 'gzip, deflate' }, signal: AbortSignal.timeout(30e3) });
   if (!res.ok) throw new Error(`SEC ${res.status} — ${url}`);
   await sleep(110); // IP당 초당 10건 제한 준수
   return res.json();
 }
 
 let tickerMap = null;
-async function cikOf(ticker) {
+export async function cikOf(ticker) {
   tickerMap ??= await edgar('https://www.sec.gov/files/company_tickers.json');
   const hit = Object.values(tickerMap).find((c) => c.ticker === ticker.toUpperCase());
   if (!hit) throw new Error(`알 수 없는 티커: ${ticker}`);

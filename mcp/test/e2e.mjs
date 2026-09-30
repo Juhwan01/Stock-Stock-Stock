@@ -10,14 +10,18 @@
  *   - 샌드박스 → `codex sandbox` 로 모델 없이, 반드시 양성 대조(위키 안 쓰기 성공)와 함께
  *
  * 실행: npm run test:e2e   (전제: codex 설치 + ChatGPT 로그인 + .env DART_API_KEY)
+ *       npm run test:e2e -- --only=watch   장중 감시 해석만 (모델 호출 1회)
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { parseEnv } from 'node:util';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isolationArgs, checkIsolation, listMcpServers } from '../../bin/sss.mjs';
 import { resolveRoute } from '../lib/models.mjs';
+import { ROUTINE_KR } from '../lib/briefing.mjs';
+import { readRecords } from '../lib/watch.mjs';
 import { LABEL } from '../lib/schedule.mjs';
 import { buildIndex, EDGE_RELS } from '../lib/wiki.mjs';
 import { today } from '../lib/decision.mjs';
@@ -58,7 +62,9 @@ function sss(label, prompt, extra = []) {
 }
 
 console.log(`임시 위키: ${WIKI}`);
-for (const r of ['exec', 'briefing']) console.log(`모델 ${r}: ${Object.values(resolveRoute(r)).join(' · ')}`);
+const ONLY = process.argv.find((a) => a.startsWith('--only='))?.slice(7) ?? null;
+const section = (name) => !ONLY || ONLY === name;
+for (const r of ['exec', 'briefing', 'watch']) console.log(`모델 ${r}: ${Object.values(resolveRoute(r)).join(' · ')}`);
 const init = spawnSync(process.execPath, [SSS, 'init'], { env, encoding: 'utf8' });
 check('sss init — 별도 git 저장소 + AGENTS.md 링크', init.status === 0 && existsSync(join(WIKI, '.git')) && existsSync(join(WIKI, 'AGENTS.md')), init.stderr.trim());
 if (!existsSync(join(WIKI, 'AGENTS.md'))) process.exit(1); // 이후 단계는 전부 무의미하다
@@ -77,6 +83,7 @@ if (!existsSync(join(WIKI, 'AGENTS.md'))) process.exit(1); // 이후 단계는 �
 }
 
 // ── 1. 과거가 현재를 교정한다 (SCENARIOS S2·S5) ─────────────────
+if (section('core')) {
 const a = sss('과거 판단 소환', '위키에서 엔비디아 루빈 지연 루머와 비슷한 과거 사례를 찾아서, 그때 내가 어떤 판단을 했고 결과와 교훈이 뭐였는지 알려줘.');
 check('exec 정상 종료', a.status === 0);
 check('유사 케이스 도구까지 호출 (서버 호출 기록)', a.calls.some((c) => c.tool === 'find_similar_cases' && c.ok), a.calls.map((c) => c.tool).join(', '));
@@ -181,6 +188,58 @@ rmSync(probe, { force: true });
   check('예약 도구는 자동 실행에서 막힘 — 승인 단계 또는 서버에서 거부', sched.every((m) => m.status === 'failed') && blocked.every((c) => !c.ok),
     sched.length ? sched.map((m) => m.error?.message ?? m.status).join(' / ') : '모델이 시도하지 않음 (규칙에 따른 거부 — 아래 결과로 판정)');
   check('이 위키로 예약된 launchd 작업이 없음', !pointsHere());
+}
+} // core
+
+// ── 7. 장중 감시 (M3) — 코드가 공시를 규칙으로 잡고, 걸린 공시만 경량 모델이 읽기 전용으로 해석한다 ──
+if (section('core') || section('watch')) {
+  const varDir = mkdtempSync(join(tmpdir(), 'sss-e2e-var-'));
+  const day = today();
+  const ymd = (d) => d.replace(/-/g, '');
+  // 오늘·어제 거래소 공시가 있는 상장사 하나를 보유로 둔다 — 기계적 공시가 아닌 것
+  const key = parseEnv(readFileSync(join(REPO, '.env'), 'utf8')).DART_API_KEY;
+  let pick = null;
+  for (const ty of ['I', 'B']) {
+    const res = await fetch(`https://opendart.fss.or.kr/api/list.json?crtfc_key=${key}&bgn_de=${ymd(addDays(day, -1))}&end_de=${ymd(day)}&pblntf_ty=${ty}&page_count=100`);
+    const list = (await res.json()).list ?? [];
+    // 원문이 이미 열린 것만 — 방금 올라온 공시는 원문 API 가 늦게 열려 감시가 해석을 미룬다(그 경로는 단위 테스트)
+    for (const x of list.filter((x) => /^\d{6}$/.test(x.stock_code) && ['Y', 'K'].includes(x.corp_cls) && !ROUTINE_KR.some((re) => re.test(x.report_nm)) && !/기재정정|첨부/.test(x.report_nm))) {
+      const doc = Buffer.from(await (await fetch(`https://opendart.fss.or.kr/api/document.xml?crtfc_key=${key}&rcept_no=${x.rcept_no}`)).arrayBuffer());
+      if (doc[0] === 0x50 && doc[1] === 0x4b) {
+        pick = x;
+        break;
+      }
+    }
+    if (pick) break;
+  }
+  check('감시 시험용 공시 고름 (오늘·어제 거래소·주요사항 공시, 원문 열림)', !!pick, pick ? `${pick.corp_name} · ${pick.report_nm.trim()}` : '없음 — 이 단계는 무의미');
+  if (pick) {
+    writeFileSync(join(WIKI, 'portfolio.yaml'), `holdings:\n  - { market: KR, code: "${pick.stock_code}", name: ${JSON.stringify(pick.corp_name)}, quantity: 1, avg_price: 1000 }\n`);
+    // 이미 켜져 있던 감시처럼 — 기준선을 지난 상태에서 시작해야 걸린 공시를 보낸다. 뉴스는 끈다(이 검사와 무관)
+    mkdirSync(join(varDir, 'watch'), { recursive: true });
+    writeFileSync(join(varDir, 'watch', 'state.json'), JSON.stringify({ baseline: { dart: true, dart_sweep: true, edgar: true, edgar_sweep: true, news: true }, last_tick: Date.now(), alerted: {} }));
+    writeFileSync(join(varDir, 'settings.json'), JSON.stringify({ watch: { news: 'off' } }));
+    const files = (dir) => readdirSync(dir, { recursive: true }).filter((f) => !String(f).startsWith('.git')).sort().join('|');
+    const wikiBefore = files(WIKI);
+    const logBefore = logLines().length;
+    const t0 = Date.now();
+    const w = spawnSync(process.execPath, [SSS, 'watch', 'once', '--interpret-now'], {
+      env: { ...env, SSS_VAR_DIR: varDir, SSS_NO_NOTIFY: '1' }, cwd: REPO, encoding: 'utf8', timeout: 600_000, maxBuffer: 64 << 20,
+    });
+    const calls = logLines().slice(logBefore).map((l) => JSON.parse(l)).filter((c) => c.wiki === WIKI);
+    console.log(`\n▸ 장중 감시 한 바퀴 + 해석: exit ${w.status} · ${((Date.now() - t0) / 1000).toFixed(1)}s · sss 호출 ${calls.map((c) => `${c.tool}${c.ok ? '' : '✗'}`).join(', ') || '없음'}`);
+    const recs = readRecords(varDir, day);
+    const alert = recs.find((r) => r.type === 'alert' && r.id === `dart:${pick.rcept_no}`);
+    // 이 시험은 텔레그램(임시 var)·macOS 알림(SSS_NO_NOTIFY)이 없다 — 규칙이 보내기로 한 것(no-channel)이면 된다
+    check('감시가 보유 종목의 공시를 규칙으로 잡음 (모델 없이)', w.status === 0 && !!alert && !alert.reason && ['telegram', 'mac', 'no-channel'].includes(alert.push), alert ? `push=${alert.push}` : (w.stderr || '').trim().split('\n').pop());
+    const interp = recs.find((r) => r.type === 'interpretation');
+    check('걸린 공시를 감시용 경량 모델이 해석 — 형식(■ 종목 · 제목)', !!interp?.ok && /■/.test(interp.text) && interp.model?.startsWith(resolveRoute('watch').model),
+      interp ? (interp.ok ? `${interp.model} · ${interp.text.length}자` : interp.error) : '해석 없음');
+    if (interp?.ok) console.log(interp.text.split('\n').map((l) => `    │ ${l}`).join('\n'));
+    check('해석 모델은 원자료를 도구(watch_alerts)로 받고 원문(dart_filing_text)까지 읽음', calls.some((c) => c.tool === 'watch_alerts' && c.ok) && calls.some((c) => c.tool === 'dart_filing_text' && c.ok),
+      calls.map((c) => c.tool).join(', '));
+    check('해석은 읽기 전용 — 위키에 파일이 생기거나 지워지지 않음', files(WIKI) === wikiBefore);
+  }
 }
 
 const passed = checks.filter(Boolean).length;

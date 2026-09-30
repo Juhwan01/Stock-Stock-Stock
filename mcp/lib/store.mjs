@@ -54,5 +54,17 @@ const KST_TIME = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul', date
 export const kstDate = (d = new Date()) => KST_DAY.format(d);
 /** 한국 시각 YYYY-MM-DD HH:MM:SS */
 export const kstStamp = (d = new Date()) => `${KST_TIME.format(d)} KST`;
+const KST_PARTS = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Seoul', hourCycle: 'h23', weekday: 'short', hour: '2-digit', minute: '2-digit' });
+const WEEKDAY = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+/** 한국 시각의 요일(0=일)·시·분 */
+export function kstParts(d = new Date()) {
+  const p = Object.fromEntries(KST_PARTS.formatToParts(d).map((x) => [x.type, x.value]));
+  return { weekday: WEEKDAY[p.weekday], hour: Number(p.hour), minute: Number(p.minute) };
+}
+/** 한국 시각 HH:MM */
+export const kstTime = (d = new Date()) => {
+  const { hour, minute } = kstParts(d);
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+};
 /** YYYY-MM-DD 에 n일을 더한다 */
 export const addDays = (day, n) => new Date(Date.parse(`${day}T00:00:00Z`) + n * 86400e3).toISOString().slice(0, 10);
