@@ -434,6 +434,17 @@ test('종료·로그아웃(SIGTERM)으로 멈춘 동안은 다음에 켤 때(run
   assert.equal(gaps(), 1, '사용자가 끈 동안은 공백이 아니다');
 });
 
+test('손으로 한 바퀴(sss watch once, startupGap=false)는 지난 실행과의 간격을 공백으로 치지 않는다', async () => {
+  const ctx = setup({ decision: false });
+  const net = fakeNet();
+  await runOnce(watcher(ctx, net).w);
+  const once = watcher(ctx, net, { startupGap: false });
+  once.clock.t = T0 + 3 * 86400e3;
+  await once.w.tick();
+  assert.equal(readRecords(ctx.varDir, '2026-10-03').filter((r) => r.type === 'gap').length, 0);
+  assert.ok(!once.sent.some((m) => m.title.includes('감시 공백')));
+});
+
 test('끄기 표시만 남고 강제 종료됐어도(신호 처리 전) 다음에 켤 때 사용자가 끈 것으로 본다', async () => {
   const ctx = setup({ decision: false });
   const net = fakeNet();
@@ -600,14 +611,14 @@ test('재검증 N4 — 한 바퀴 도중에 잠금을 잃으면 그 바퀴의 �
   let beats = 0;
   const filings = { '005930': [] };
   const { w, alerts, advance } = watcher(ctx, net, {
-    heartbeat: () => ++beats < 2,
+    heartbeat: () => ++beats < 3, // 1: 첫 바퀴 저장 · 2: 알림 직전 확인 · 3: 알림 뒤 저장에서 잃음
     dart: { filings: async (code) => ({ filings: filings[code] ?? [] }) },
   });
   await w.tick(); // 기준선 · 저장 1회(잠금 유지)
   net.dart = [dartRow(3, '000660', '잠정실적')];
   filings['005930'] = [{ rcept_no: '20260930000099', date: '2026-09-30', title: '배당결정', url: 'https://dart.fss.or.kr/y' }];
   advance(600e3);
-  await w.tick(); // 빠른 길 알림 → 저장하며 잠금 잃음 → 같은 바퀴의 종목별 점검은 보내지 않는다
+  await w.tick(); // 빠른 길 알림 → 저장하며 잠금 잃음 → 같은 바퀴의 종목별 점검은 보내기 직전 확인에서 멈춘다
   assert.equal(w.mem.lockLost, true);
   assert.equal(alerts().length, 1);
 });

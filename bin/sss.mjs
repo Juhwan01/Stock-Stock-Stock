@@ -612,6 +612,7 @@ async function watch(rest) {
       interpret: dryRun ? null : (b) => interpretBatch(b, baseEnv),
       keepAwake,
       heartbeat: release.refresh,
+      startupGap: sub === 'run',
     });
     try {
       if (sub === 'once') {

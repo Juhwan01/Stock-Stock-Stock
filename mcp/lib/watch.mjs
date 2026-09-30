@@ -355,9 +355,10 @@ export function requestStop(varDir) {
  * @param now       벽시계(ms)
  * @param dryRun    알림·기록·상태를 쓰지 않고 로그로만 (상태는 읽는다 — 실제로 무엇이 갈지 보인다)
  * @param keepAwake (on) => void — 틱마다 설정의 keep_awake 를 넘긴다 (잠자기 막기는 실행기가 한다)
- * @param heartbeat () => boolean — 상태를 저장할 때마다 (잠금 갱신). false 면 잠금을 잃은 것 — 다른 감시가 넘겨받았다
+ * @param heartbeat () => boolean — 상태를 저장할 때마다·알림을 보내기 직전에 (잠금 갱신). false 면 잠금을 잃은 것 — 다른 감시가 넘겨받았다
+ * @param startupGap 새로 뜰 때 직전 감시와의 공백을 볼지 — 손으로 한 바퀴 돌리는 sss watch once 는 끈다 (상주 감시가 아니다)
  */
-export function createWatcher({ root, varDir, env = {}, wiki, dart, edgar, fetch = globalThis.fetch, now = () => Date.now(), notify, interpret = null, log = () => {}, dryRun = false, settingsFile = SETTINGS_FILE, feeds = NEWS_FEEDS, keepAwake = null, heartbeat = null }) {
+export function createWatcher({ root, varDir, env = {}, wiki, dart, edgar, fetch = globalThis.fetch, now = () => Date.now(), notify, interpret = null, log = () => {}, dryRun = false, settingsFile = SETTINGS_FILE, feeds = NEWS_FEEDS, keepAwake = null, heartbeat = null, startupGap = true }) {
   const state = readWatchState(varDir);
   state.alerted ??= {};
   state.sources ??= {};
@@ -388,17 +389,21 @@ export function createWatcher({ root, varDir, env = {}, wiki, dart, edgar, fetch
     tooMany: false,
   };
 
+  /** 아직 잠금을 쥐고 있는가 — 갱신도 겸한다. 잃었으면 이 감시는 더 보내거나 쓰지 않는다 */
+  const owner = () => {
+    if (mem.lockLost) return false;
+    if (heartbeat && heartbeat() === false) {
+      mem.lockLost = true;
+      log('잠금을 잃었다 — 다른 감시가 넘겨받았다. 이 감시는 끝낸다');
+    }
+    return !mem.lockLost;
+  };
   const save = (force = false) => {
     if (dryRun || mem.lockLost) return; // 잠금을 잃었으면 상태는 넘겨받은 감시의 것이다
     const t = now();
     if (!force && t - mem.lastSave < HEARTBEAT_MS) return;
     mem.lastSave = t;
-    // 잠금부터 갱신한다 — 넘겨받혔으면 한 번도 쓰지 않고 멈춘다
-    if (heartbeat && heartbeat() === false) {
-      mem.lockLost = true;
-      log('잠금을 잃었다 — 다른 감시가 넘겨받았다. 이 감시는 끝낸다');
-      return;
-    }
+    if (!owner()) return; // 잠금부터 갱신한다 — 넘겨받혔으면 한 번도 쓰지 않고 멈춘다
     state.alive = t;
     // 알림을 보낸 id 는 7일만 둔다 — 종목별 점검은 어제·오늘만 본다
     const cutoff = addDays(kstDate(new Date(t)), -7);
@@ -493,7 +498,7 @@ export function createWatcher({ root, varDir, env = {}, wiki, dart, edgar, fetch
     const byId = new Map();
     for (const a of alerts) if (!state.alerted[a.id] && !byId.has(a.id)) byId.set(a.id, a); // 한 폴링 안의 중복도 뺀다
     const fresh = [...byId.values()];
-    if (!fresh.length) return;
+    if (!fresh.length || !owner()) return; // 보내기 직전에 잠금 확인 — 넘겨받은 감시와 겹쳐 두 번 가지 않게
     const t = new Date(now());
     const { hour } = kstParts(t);
     const quiet = hour < 7 || hour >= 22;
@@ -524,7 +529,7 @@ export function createWatcher({ root, varDir, env = {}, wiki, dart, edgar, fetch
     const byId = new Map();
     for (const a of alerts) if (!state.alerted[a.id] && !byId.has(a.id)) byId.set(a.id, a);
     const fresh = [...byId.values()];
-    if (!fresh.length) return;
+    if (!fresh.length || !owner()) return;
     const byTarget = new Map();
     for (const a of fresh) {
       const key = `${a.market}:${a.code}`;
@@ -779,7 +784,7 @@ export function createWatcher({ root, varDir, env = {}, wiki, dart, edgar, fetch
         delete state.stopped_at;
         mem.nextAt.dart_sweep = 0; // 켤 때 어제·오늘을 종목별로 따라잡는다
         mem.nextAt.edgar_sweep = 0;
-      } else if (lastSeen && t - lastSeen > GAP_MS) gap = { from: lastSeen, to: t };
+      } else if (startupGap && lastSeen && t - lastSeen > GAP_MS) gap = { from: lastSeen, to: t };
     } else if (mem.pendingGap) {
       gap = mem.pendingGap;
       mem.pendingGap = null;
