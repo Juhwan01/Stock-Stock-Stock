@@ -24,14 +24,14 @@ const DART_PAGES = 10; // 종목당 최대 1,000건 — 넘으면 수집 공백�
 const EDGAR_RECENT = 200;
 
 // 분류 힌트 — 대형주에 매일 쏟아지는 기계적 공시. 최종 판단은 에이전트가 한다
-const ROUTINE_KR = [
+export const ROUTINE_KR = [
   /임원\s*[ㆍ·.]?\s*주요주주\s*특정증권등\s*소유상황보고서/,
   /주식등의\s*대량보유상황보고서/,
   /증권발행실적보고서/,
   /투자설명서/,
   /일괄신고추가서류/,
 ];
-const ROUTINE_US = new Set(['3', '4', '5', '144', 'SC 13G', 'SC 13G/A', '424B2', '424B3', 'FWP', 'S-8']);
+export const ROUTINE_US = new Set(['3', '4', '5', '144', 'SC 13G', 'SC 13G/A', '424B2', '424B3', 'FWP', 'S-8']);
 
 const ymd = (d) => d.replace(/-/g, '');
 
@@ -198,12 +198,12 @@ export function readInbox(root, run) {
 // 살아 있는 pid 라도 이만큼 지난 잠금은 pid 재사용으로 본다. 실행기의 모델 시간 제한(20분) + 수집보다 넉넉히
 const LOCK_STALE_MS = 2 * 3600e3;
 
-const lockPath = (lockDir, root) => {
+const lockPath = (lockDir, root, kind = 'briefing') => {
   let wiki = resolve(root);
   try {
     wiki = realpathSync(root);
   } catch {}
-  return join(lockDir, `briefing-${createHash('sha1').update(wiki).digest('hex').slice(0, 12)}.lock`);
+  return join(lockDir, `${kind}-${createHash('sha1').update(wiki).digest('hex').slice(0, 12)}.lock`);
 };
 
 const readLock = (path) => {
@@ -213,8 +213,8 @@ const readLock = (path) => {
     return null;
   }
 };
-const live = (lock) => {
-  if (!Number.isInteger(lock?.pid) || !(Date.now() - lock.at < LOCK_STALE_MS)) return false;
+const live = (lock, staleMs = LOCK_STALE_MS) => {
+  if (!Number.isInteger(lock?.pid) || !(Date.now() - lock.at < staleMs)) return false;
   try {
     process.kill(lock.pid, 0);
   } catch (e) {
@@ -229,15 +229,22 @@ export function runningBriefing(lockDir, root) {
   return live(lock) ? { pid: lock.pid, started: lock.started } : null;
 }
 
+const KINDS = {
+  briefing: { code: 'SSS_BRIEFING_RUNNING', what: '이 위키의 브리핑이', after: ' — 끝나면 briefings/ 에 파일이 생긴다' },
+  watch: { code: 'SSS_WATCH_RUNNING', what: '상시 감시가', after: ' — 둘이 돌면 알림이 두 번 간다' },
+};
+
 /**
  * 잠금을 잡고 푸는 함수를 돌려준다. 이미 돌고 있으면 던진다.
  * 먼저 만든다(wx) — "확인 후 지우고 만들기"는 사이에 다른 실행이 잡은 잠금을 지운다 (코드 리뷰 재현: 동시 4개 중 2개가 잡음).
- * 죽은 잠금은 차단 파일(.break)을 잡은 한 프로세스만 치운다
+ * 죽은 잠금은 차단 파일(.break)을 잡은 한 프로세스만 치운다.
+ * kind 'watch' 는 상주 감시용 — staleMs 를 짧게 두고, 쥔 쪽이 release.refresh() 로 시각을 갱신한다
  */
-export function acquireRunLock(lockDir, root) {
-  const busy = (msg) => Object.assign(new Error(msg), { code: 'SSS_BRIEFING_RUNNING' });
-  const running = (lock) => busy(`이 위키의 브리핑이 이미 실행 중이다 (pid ${lock.pid}, ${lock.started} 시작) — 끝나면 briefings/ 에 파일이 생긴다`);
-  const path = lockPath(lockDir, root);
+export function acquireRunLock(lockDir, root, { kind = 'briefing', staleMs = LOCK_STALE_MS } = {}) {
+  const k = KINDS[kind];
+  const busy = (msg) => Object.assign(new Error(msg), { code: k.code });
+  const running = (lock) => busy(`${k.what} 이미 실행 중이다 (pid ${lock.pid}, ${lock.started} 시작)${k.after}`);
+  const path = lockPath(lockDir, root, kind);
   mkdirSync(lockDir, { recursive: true });
   const mine = JSON.stringify({ pid: process.pid, at: Date.now(), started: kstStamp() });
   // 내용을 다 쓴 임시 파일을 링크로 건다 — wx 로 바로 쓰면 빈 파일인 순간을 다른 실행이 "죽은 잠금"으로 읽는다 (코드 리뷰)
@@ -256,7 +263,7 @@ export function acquireRunLock(lockDir, root) {
   };
   if (!create()) {
     const held = readLock(path);
-    if (live(held)) throw running(held);
+    if (live(held, staleMs)) throw running(held);
     const breaker = `${path}.break`;
     // 동기 호출 몇 개 사이에 죽어 남은 차단 파일 — 몇 초 넘었으면 치운다. 치우는 순간 다른 실행이 새로 잡은 것을
     // 지울 수 있지만, 그러려면 임계 구역(동기 호출 몇 개) 안에서 죽은 실행과 동시 경쟁이 겹쳐야 한다 — 받아들인다
@@ -266,21 +273,28 @@ export function acquireRunLock(lockDir, root) {
     try {
       writeFileSync(breaker, String(process.pid), { flag: 'wx' });
     } catch (e) {
-      if (e.code === 'EEXIST') throw busy('이 위키의 브리핑이 방금 다른 곳에서 시작됐다');
+      if (e.code === 'EEXIST') throw busy(`${k.what} 방금 다른 곳에서 시작됐다`);
       throw e;
     }
     try {
       const now = readLock(path);
-      if (live(now)) throw running(now); // 차단 파일을 잡기 전에 다른 실행이 넘겨받았다
+      if (live(now, staleMs)) throw running(now); // 차단 파일을 잡기 전에 다른 실행이 넘겨받았다
       rmSync(path, { force: true });
-      if (!create()) throw busy('이 위키의 브리핑이 방금 다른 곳에서 시작됐다');
+      if (!create()) throw busy(`${k.what} 방금 다른 곳에서 시작됐다`);
     } finally {
       rmSync(breaker, { force: true });
     }
   }
-  return () => {
+  const release = () => {
     if (readLock(path)?.pid === process.pid) rmSync(path, { force: true });
   };
+  /** 쥐고 있다는 표시를 갱신한다 — rename 이라 잠금 파일이 없는 순간이 없다 */
+  release.refresh = () => {
+    if (readLock(path)?.pid !== process.pid) return false; // 넘겨받혔다 — 쥔 쪽은 멈춰야 한다
+    writeAtomic(path, JSON.stringify({ ...JSON.parse(mine), at: Date.now() }));
+    return true;
+  };
+  return release;
 }
 
 export const briefingPath = (root, date) => join(wikiDir(root, BRIEFINGS), `${date}.md`);
@@ -306,6 +320,10 @@ export function fallbackMarkdown(inbox, reason) {
       ? flagged.map((d) => `- 열린 판단 [[${d.id}]] 의 대상에 새 항목 ${d.related_items.length}건 — 무효화 조건: ${d.invalidation_condition}`)
       : [`- 열린 판단 ${inbox.open_decisions.length}건 — 대상 종목의 새 항목 없음`]),
     `- 대기 중 제안 ${inbox.pending_proposals.count}건`,
+    ...(inbox.watch
+      ? [`- 장중 감시: 알림 ${inbox.watch.alerts}건 (보냄 ${inbox.watch.pushed})${inbox.watch.running ? '' : ` · ⚠ 감시가 멈춰 있음 (마지막 ${inbox.watch.last_seen ?? '?'})`}`,
+        ...inbox.watch.gaps.map((g) => `- ⚠ 감시 공백 ${g.from} ~ ${g.to} (${g.minutes}분) — 그 사이 공시는 이 브리핑이 모은 것이 전부`)]
+      : []),
   ]);
   for (const [role, title] of [['holding', '보유 종목'], ['watch', '관심 종목']]) {
     const xs = inbox.items.filter((i) => i.role === role);

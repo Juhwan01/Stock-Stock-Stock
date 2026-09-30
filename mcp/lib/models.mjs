@@ -6,13 +6,9 @@
  * 설정 파일은 레포의 var/ 에 둔다 — 에이전트의 쓰기 범위(wiki/) 밖이라 승인을 거친 도구로만 바뀐다
  */
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readSettings, updateSettings, SETTINGS_FILE } from './settings.mjs';
 
-const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-// 테스트는 SSS_VAR_DIR 로 실행 산출물(설정·로그·잠금) 위치를 바꾼다
-export const SETTINGS_FILE = join(process.env.SSS_VAR_DIR ?? join(REPO, 'var'), 'settings.json');
+export { readSettings, SETTINGS_FILE };
 
 /** 이름은 `codex debug models` 목록에서 골랐다 (2026-09-27). doctor·model_settings 가 목록과 대조한다 */
 export const ROUTES = {
@@ -20,6 +16,8 @@ export const ROUTES = {
   deep: { model: 'gpt-6-astra', effort: 'high', what: '판단 기록·복기 (sss deep)' },
   exec: { model: 'gpt-6-luna', effort: 'medium', what: '비대화 실행 (sss exec · E2E)' },
   briefing: { model: 'gpt-6-luna', effort: 'medium', what: '아침 브리핑 분류·해석' },
+  // 장중에 여러 번 돈다 — 공시 한두 건을 읽고 몇 줄로 요약하는 일이라 가장 가볍게
+  watch: { model: 'gpt-6-luna', effort: 'low', what: '장중 감시 알림 해석' },
 };
 
 /** CODEX_API_KEY 가 있으면 codex 가 조용히 API 과금으로 넘어간다 */
@@ -28,15 +26,6 @@ const codexEnv = () => {
   delete env.CODEX_API_KEY;
   return env;
 };
-
-export function readSettings(file = SETTINGS_FILE) {
-  try {
-    const s = JSON.parse(readFileSync(file, 'utf8'));
-    return s && typeof s === 'object' && !Array.isArray(s) ? s : {};
-  } catch {
-    return {};
-  }
-}
 
 /** { model, effort, source } — source 는 값이 어디서 왔는지 (default · settings · env) */
 export function resolveRoute(route, { env = process.env, settings = readSettings() } = {}) {
@@ -106,10 +95,7 @@ export function updateRoute({ route, model, effort, reset = false }, { file = SE
     if (problem) throw new Error(problem);
     models[route] = { model: next.model, effort: next.effort };
   }
-  mkdirSync(dirname(file), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify({ ...settings, models }, null, 2));
-  renameSync(tmp, file);
+  updateSettings((cur) => ({ ...cur, models }), file);
   return { route, ...resolveRoute(route, { env: {}, settings: { models } }), default: { model: ROUTES[route].model, effort: ROUTES[route].effort } };
 }
 

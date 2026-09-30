@@ -11,6 +11,8 @@ import { dirname } from 'node:path';
 import { inflateRawSync } from 'node:zlib';
 
 const API = 'https://opendart.fss.or.kr/api';
+// 원문 API 가 아직 파일을 주지 않는다 — 방금 목록에 오른 공시는 원문이 늦게 열린다 (M3 실측)
+export const DOC_NOT_READY = '014';
 const CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 // DART 응답 코드 — 013 은 "데이터 없음"이라 오류가 아니다
@@ -108,7 +110,8 @@ export function createDart({ key = () => process.env.DART_API_KEY, cacheFile, fe
 
   async function call(path, params) {
     const qs = new URLSearchParams({ crtfc_key: apiKey(), ...params });
-    const res = await fetchImpl(`${API}/${path}?${qs}`);
+    // 원문 ZIP 은 클 수 있어 넉넉히. 멈춘 응답이 감시·도구를 붙잡지 않게 끊는다
+    const res = await fetchImpl(`${API}/${path}?${qs}`, { signal: AbortSignal.timeout(60e3) });
     if (!res.ok) throw new Error(`DART HTTP ${res.status} — ${path}`);
     return res;
   }
@@ -195,9 +198,31 @@ export function createDart({ key = () => process.env.DART_API_KEY, cacheFile, fe
       };
     },
 
+    /** 원문 API 가 파일을 주는지 — 목록에 오른 직후에는 014(파일 없음)를 준다. 감시가 해석을 미룰지 정한다 */
+    async documentReady(rceptNo) {
+      // 첫 조각만 읽고 끊는다 — 열린 원문 ZIP 을 매번 통째로 받지 않게
+      const res = await call('document.xml', { rcept_no: rceptNo });
+      const reader = res.body.getReader();
+      const { value } = await reader.read();
+      await reader.cancel().catch(() => {});
+      const buf = Buffer.from(value ?? []);
+      if (buf.length >= 4 && buf.readUInt32LE(0) === 0x04034b50) return true;
+      const status = buf.toString('utf8', 0, 400).match(/<status>(\d+)<\/status>/)?.[1];
+      if (status === DOC_NOT_READY) return false;
+      throw new Error(`DART document.xml ${status ?? '응답이 ZIP 이 아님'} — ${rceptNo}`);
+    },
+
     /** 공시 원문 텍스트 (앞부분). 표는 | 로 이어진 행으로 나온다 */
     async filingText(rceptNo, { maxChars = 6000 } = {}) {
       const buf = Buffer.from(await (await call('document.xml', { rcept_no: rceptNo })).arrayBuffer());
+      if (!(buf.length >= 4 && buf.readUInt32LE(0) === 0x04034b50)) {
+        // ZIP 대신 오류 XML — 원인을 그대로 알린다
+        const head = buf.toString('utf8', 0, 400);
+        const status = head.match(/<status>(\d+)<\/status>/)?.[1];
+        const message = head.match(/<message>([^<]*)<\/message>/)?.[1];
+        if (status === DOC_NOT_READY) throw new Error(`DART 014 ${message ?? '파일 없음'} — 방금 올라온 공시는 원문이 API 에 늦게 열린다. 공시 뷰어 링크를 안내하고 나중에 다시 읽는다`);
+        if (status) throw new Error(`DART ${status} ${message ?? ''} — document.xml`);
+      }
       const files = unzip(buf);
       const parts = Object.entries(files)
         .sort(([a], [b]) => a.localeCompare(b))

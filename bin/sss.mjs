@@ -11,8 +11,13 @@
  *   sss briefing [옵션…]         아침 브리핑 — 코드가 새 공시를 모으고, 모델이 분류·해석해 wiki/briefings/<날짜>.md 를 쓴다
  *        --date YYYY-MM-DD  --since YYYY-MM-DD  --model <모델>  --no-llm(원자료만)  --dry-run(수집만)
  *   sss schedule install [--time 07:30] | uninstall | status   평일 아침 브리핑을 launchd 에 등록·해제
+ *   sss watch install | uninstall | status | run | once [--dry-run] [--interpret-now]
+ *                               상시 감시 — 공시(DART 20초 · SEC 1분)·뉴스 RSS 를 보유·관심 종목·열린 판단과 맞춰 텔레그램으로 민다.
+ *                               install 은 launchd 상주(로그인 때 뜨고 죽으면 다시 뜬다), run 은 그 본체, once 는 한 바퀴만
+ *   sss telegram link | test | unlink | status   텔레그램 연결 — 토큰은 .env 의 TELEGRAM_BOT_TOKEN (@BotFather 에서 발급)
  *
- * 모든 조작은 대화로도 된다 — "아침 7시 반에 브리핑 예약해줘", "지금 브리핑 돌려줘", "브리핑 모델 올려줘", "상태 점검해줘".
+ * 모든 조작은 대화로도 된다 — "아침 7시 반에 브리핑 예약해줘", "지금 브리핑 돌려줘", "브리핑 모델 올려줘", "상태 점검해줘",
+ * "실시간 감시 켜줘", "텔레그램 연결해줘", "오늘 알림 뭐 왔어?".
  * 위의 명령들은 같은 일을 하는 예비 경로다. 처음 sss 를 띄우면 위키를 자동으로 만든다.
  *
  * 모델은 용도별로 고른다 (mcp/lib/models.mjs ROUTES) — 지정하지 않으면 Codex 기본값인 최상위 모델로 돌아 구독 한도를 빨리 쓴다.
@@ -30,6 +35,7 @@
  *  - CODEX_API_KEY 를 자식 환경에서 지운다 — 있으면 exec 가 조용히 API 과금으로 넘어간다
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,11 +44,13 @@ import { readPortfolio, universe } from '../mcp/lib/portfolio.mjs';
 import { listProposals } from '../mcp/lib/proposals.mjs';
 import { acquireRunLock, briefingPath, nextBriefingPath, nextLastDate, collectUpdates, decisionContext, produceBriefing, readState, renderPrompt, sinceFor, writeInbox, writeState } from '../mcp/lib/briefing.mjs';
 import { createDart } from '../mcp/lib/dart.mjs';
-import { recentFilings } from '../mcp/lib/edgar.mjs';
+import { cikOf, recentFilings } from '../mcp/lib/edgar.mjs';
 import { createWiki } from '../mcp/lib/wiki.mjs';
 import { kstDate, kstStamp, readRegular, writeAtomic } from '../mcp/lib/store.mjs';
 import { codexModels, modelArgs, resolveRoute, routeTable } from '../mcp/lib/models.mjs';
-import { installSchedule, scheduleStatus, uninstallSchedule } from '../mcp/lib/schedule.mjs';
+import { installSchedule, installWatch, scheduleStatus, uninstallSchedule, uninstallWatch, watchAgentStatus } from '../mcp/lib/schedule.mjs';
+import { acquireWatchLock, createWatcher, requestStop, watchDigest, watchLogger, watchStatus } from '../mcp/lib/watch.mjs';
+import { confirmLink, createTelegram, push, startLink, telegramStatus, unlink } from '../mcp/lib/telegram.mjs';
 
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const WIKI = resolve(process.env.SSS_WIKI_DIR ?? join(REPO, 'wiki'));
@@ -60,6 +68,8 @@ export const WRITE_TOOLS = [
   'decision_record', 'decision_update', 'watchlist_update', 'holdings_update', 'proposal_resolve',
   // 운영 — 예약·실행(구독 한도)·모델 설정도 사용자가 인자를 보고 승인한다
   'briefing_schedule', 'briefing_run', 'model_settings',
+  // 상시 감시 켜기·끄기·설정, 텔레그램 연결 — 알림이 어디로 가는지와 구독 한도(해석)를 바꾼다
+  'watch_control', 'telegram_link',
 ];
 
 
@@ -105,7 +115,8 @@ export function disableArgs(servers) {
 const tomlStr = (s) => JSON.stringify(s);
 
 /** sandbox: 대화·일반 exec 는 workspace-write(위키 안 쓰기), 아침 브리핑은 read-only — 외부 공시 본문을 읽는 무인 실행이라 */
-export function isolationArgs({ wiki = WIKI, servers = [], mode = 'chat', autoApproveWrites = false, sandbox = 'workspace-write' } = {}) {
+/** purpose: 'watch' 면 서버가 감시 해석에 필요 없는 쓰기(제안 대기열)도 거부한다 */
+export function isolationArgs({ wiki = WIKI, servers = [], mode = 'chat', autoApproveWrites = false, sandbox = 'workspace-write', purpose = null } = {}) {
   const writeApproval = mode === 'exec' && autoApproveWrites ? 'approve' : 'prompt';
   return [
     '-C', wiki,
@@ -124,8 +135,11 @@ export function isolationArgs({ wiki = WIKI, servers = [], mode = 'chat', autoAp
     '-c', `mcp_servers.sss.command=${tomlStr(process.execPath)}`,
     '-c', `mcp_servers.sss.args=[${tomlStr(SERVER)}]`,
     '-c', `mcp_servers.sss.env.SSS_WIKI_DIR=${tomlStr(wiki)}`,
+    // 서버가 실행기와 같은 var/ 를 본다 — 감시 기록(watch_alerts)·설정·로그. codex 는 MCP 서버에 환경 변수를 다 넘기지 않는다
+    '-c', `mcp_servers.sss.env.SSS_VAR_DIR=${tomlStr(VAR)}`,
     // 서버가 자동 실행인지 안다 — 사용자 결정을 대신하는 도구(proposal_resolve)를 exec 에서 거부한다
     '-c', `mcp_servers.sss.env.SSS_MODE=${tomlStr(mode)}`,
+    ...(purpose ? ['-c', `mcp_servers.sss.env.SSS_PURPOSE=${tomlStr(purpose)}`] : []),
     '-c', 'mcp_servers.sss.required=true',
     '-c', 'mcp_servers.sss.startup_timeout_sec=20',
     // 조회 도구는 자동 승인 — 없으면 exec(승인 정책 never)에서 호출이 거부된다
@@ -175,10 +189,10 @@ export function integrityProblems(wiki = WIKI) {
 }
 
 /** 무결성·격리 점검을 통과한 codex 인자. 통과하지 못하면 던진다 — 띄우지 않는다 */
-function codexArgs(mode, { autoApproveWrites = false, sandbox } = {}) {
+function codexArgs(mode, { autoApproveWrites = false, sandbox, purpose } = {}) {
   const problems = integrityProblems();
   if (problems.length) throw new Error(problems.map((p) => `✖ ${p}`).join('\n'));
-  const args = isolationArgs({ servers: listMcpServers(), mode, autoApproveWrites, sandbox });
+  const args = isolationArgs({ servers: listMcpServers(), mode, autoApproveWrites, sandbox, purpose });
   checkIsolation(args);
   return args;
 }
@@ -339,12 +353,16 @@ function doctor() {
   for (const r of routeTable({ catalog, env: {} })) {
     add(!r.problem, `모델 — ${r.what}`, `${r.model} · ${r.effort}${r.source === 'settings' ? ' (대화에서 바꿈)' : ''}${r.problem ? ` — ${r.problem}` : ''}`, !!catalog);
   }
-  const stale = Object.keys(env).filter((k) => /^SSS_(CHAT|DEEP|EXEC|BRIEFING)_(MODEL|EFFORT)$/.test(k));
+  const stale = Object.keys(env).filter((k) => /^SSS_(CHAT|DEEP|EXEC|BRIEFING|WATCH)_(MODEL|EFFORT)$/.test(k));
   if (stale.length) add(false, '.env 의 모델 설정은 읽지 않는다', `${stale.join(' ')} — 대화에서 "브리핑 모델 바꿔줘"(model_settings)로 옮긴다`, false);
-  const overrides = Object.keys(process.env).filter((k) => /^SSS_(CHAT|DEEP|EXEC|BRIEFING)_(MODEL|EFFORT)$/.test(k));
+  const overrides = Object.keys(process.env).filter((k) => /^SSS_(CHAT|DEEP|EXEC|BRIEFING|WATCH)_(MODEL|EFFORT)$/.test(k));
   if (overrides.length) add(false, '이 셸의 모델 덮어쓰기', `${overrides.map((k) => `${k}=${process.env[k]}`).join(' ')} — 이 셸에서 띄운 실행에만 적용`, false);
   const sch = scheduleStatus();
   add(sch.registered, '평일 아침 브리핑 예약 (launchd)', sch.registered ? `등록됨 · ${sch.time ?? '?'}` : '대화에서 "아침 7시 반에 브리핑 예약해줘" 또는 node bin/sss.mjs schedule install', false);
+  const w = watchStatus(VAR, { agent: watchAgentStatus() });
+  add(w.registered && w.running, '상시 감시 (launchd 상주)', w.registered ? (w.running ? `실행 중 · 마지막 ${w.last_seen}` : `등록됐지만 멈춤 — 로그: var/watch.log · var/watch.launchd.log`) : '대화에서 "실시간 감시 켜줘" 또는 node bin/sss.mjs watch install', false);
+  const tg = telegramStatus({ env });
+  add(tg.linked, '텔레그램 알림', tg.linked ? `연결됨 · ${tg.chat}` : tg.token_set ? '토큰 있음 · 대화에서 "텔레그램 연결해줘"' : '.env 에 TELEGRAM_BOT_TOKEN 없음 — 텔레그램 @BotFather 에서 봇을 만든다', false);
   add(false, '알려진 한계', '샌드박스는 디스크 읽기를 막지 않는다 — 에이전트 셸이 .env 를 읽을 수 있고 AGENTS.md 규칙이 방어선', false);
 
   for (const r of rows) console.log(`${r.ok ? '✅' : r.required ? '❌' : '⚪'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`);
@@ -354,7 +372,7 @@ function doctor() {
 // ── 아침 브리핑 ─────────────────────────────────────────────────
 const BRIEFING_PROMPT = join(REPO, 'agent', 'BRIEFING.md');
 // 테스트는 SSS_VAR_DIR 로 실행 산출물(로그·잠금·모델 답)의 위치를 바꾼다
-const VAR = process.env.SSS_VAR_DIR ?? join(REPO, 'var');
+const VAR = resolve(process.env.SSS_VAR_DIR ?? join(REPO, 'var'));
 const BRIEFING_LOG = join(VAR, 'briefing.log');
 const BRIEFING_TIMEOUT_MS = 20 * 60e3;
 
@@ -373,24 +391,25 @@ function option(rest, name) {
   return rest.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 }
 
-function notify(title, message) {
-  if (process.platform !== 'darwin' || process.env.SSS_NO_NOTIFY === '1') return;
-  // JSON 문자열 표기는 AppleScript 문자열 이스케이프(\" \\)와 호환된다
-  spawnSync('osascript', ['-e', `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`], { stdio: 'ignore' });
-}
+/** 알림 — 텔레그램이 연결돼 있으면 텔레그램, 아니면 macOS 알림. 실패해도 브리핑은 실패하지 않는다 */
+const notify = (title, text) => push({ title, text }, { env: readDotEnv() }).catch(() => {});
 
-function runCodex(argv, env) {
+/** quiet 면 codex 의 진행 출력을 버리고 표준 에러 끝부분만 남긴다 (상주 감시의 로그가 불지 않게) → { code, stderr } */
+function runCodex(argv, env, { timeoutMs = BRIEFING_TIMEOUT_MS, quiet = false } = {}) {
   return new Promise((done) => {
-    const child = spawn('codex', argv, { stdio: 'inherit', env: childEnv(env) });
-    const timer = setTimeout(() => child.kill('SIGTERM'), BRIEFING_TIMEOUT_MS);
+    const child = spawn('codex', argv, { stdio: quiet ? ['ignore', 'ignore', 'pipe'] : 'inherit', env: childEnv(env) });
+    let stderr = '';
+    child.stderr?.on('data', (b) => (stderr = (stderr + b).slice(-4000)));
+    const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
     child.on('error', (e) => {
       clearTimeout(timer);
-      console.error(e.code === 'ENOENT' ? 'codex 가 없습니다 → npm i -g @openai/codex && codex login' : e.message);
-      done(127);
+      const msg = e.code === 'ENOENT' ? 'codex 가 없습니다 → npm i -g @openai/codex && codex login' : e.message;
+      if (!quiet) console.error(msg);
+      done({ code: 127, stderr: msg });
     });
     child.on('exit', (code, signal) => {
       clearTimeout(timer);
-      done(signal ? 124 : code ?? 1);
+      done({ code: signal ? 124 : code ?? 1, stderr });
     });
   });
 }
@@ -459,6 +478,8 @@ async function briefingLocked(rest) {
     failures,
     open_decisions: decisionContext(db, items),
     pending_proposals: { count: pending.total, oldest: pending.proposals.map((p) => ({ id: p.id, title: p.title, age_days: p.age_days })) },
+    // 장중 감시를 켰으면 그 사이 알림 수와 감시 공백 — 공백 구간의 공시는 이 브리핑이 종목별로 다시 모은 것이 전부다
+    watch: watchDigest(VAR, since, date),
     notes: ['시세는 싣지 않는다 — 공식 일별 시세는 T+1 13시라 아침엔 이틀 전 값이고, 실시간은 증권사 연결(M4) 후'],
   };
   writeInbox(WIKI, inbox);
@@ -474,7 +495,7 @@ async function briefingLocked(rest) {
     const answer = join(VAR, `briefing-${run}-${process.pid}.md`);
     mkdirSync(dirname(answer), { recursive: true });
     try {
-      const code = await runCodex(['exec', ...codexArgs('exec', { sandbox: 'read-only' }), '-o', answer, ...briefingModelArgs(rest), prompt], baseEnv);
+      const { code } = await runCodex(['exec', ...codexArgs('exec', { sandbox: 'read-only' }), '-o', answer, ...briefingModelArgs(rest), prompt], baseEnv);
       return { code, text: readRegular(answer) };
     } finally {
       rmSync(answer, { force: true });
@@ -494,7 +515,8 @@ async function briefingLocked(rest) {
     ? `원자료만 · 새 항목 ${items.length}건`
     : `${n('proposals') != null ? `제안 ${n('proposals')} · 참고 ${n('notes') ?? '?'} · 무시 ${n('ignored') ?? '?'}` : `새 항목 ${items.length}건`}${result.missing ? ` · 누락 ${result.missing}건 원자료로 보충` : ''}`;
   log(`완료 → ${out} (${summary})`);
-  notify('sss 아침 브리핑', `${date} · ${summary}`);
+  const lead = result.markdown.match(/(?:^|\n)## 먼저 볼 것\n+([\s\S]*?)(?=\n## |$)/)?.[1]?.trim();
+  await notify(`📋 sss 아침 브리핑 ${date}`, `${summary}${lead ? `\n\n먼저 볼 것\n${lead}` : ''}\n\n전체: wiki/briefings/${basename(out)} — 대화에서 "오늘 브리핑 보여줘"`);
 }
 
 // ── 예약 (launchd) — 대화 도구 briefing_schedule 과 같은 코드 ──────────
@@ -517,6 +539,140 @@ function schedule(rest) {
     }
   } else {
     throw new Error(`알 수 없는 schedule 명령: ${sub} (install | uninstall | status)`);
+  }
+}
+
+// ── 상시 감시 (M3) — 대화 도구 watch_control 과 같은 코드 ─────────────
+const WATCH_PROMPT = join(REPO, 'agent', 'WATCH.md');
+const WATCH_TIMEOUT_MS = 5 * 60e3;
+const WATCH_LAUNCHD_LOG = join(VAR, 'watch.launchd.log');
+
+/** 감시 해석 용도의 모델 인자 */
+export const watchModelArgs = (opts) => modelArgs(resolveRoute('watch', opts));
+
+/**
+ * 걸린 공시 묶음을 모델이 해석한다 — 브리핑과 같은 격리: 읽기 전용 샌드박스, 원자료는 도구(watch_alerts)로, 답은 최종 답(-o)으로.
+ * 공시 본문에 심긴 지시가 위키를 고치지 못하고, 답은 사용자의 텔레그램으로만 간다
+ */
+async function interpretBatch({ batch, items }, baseEnv) {
+  const route = resolveRoute('watch');
+  const prompt = renderPrompt(readFileSync(WATCH_PROMPT, 'utf8'), { batch, count: items.length });
+  const answer = join(VAR, 'watch', `answer-${batch}-${process.pid}.md`);
+  mkdirSync(dirname(answer), { recursive: true });
+  try {
+    const { code, stderr } = await runCodex(['exec', ...codexArgs('exec', { sandbox: 'read-only', purpose: 'watch' }), '-o', answer, ...watchModelArgs(), prompt], baseEnv, { timeoutMs: WATCH_TIMEOUT_MS, quiet: true });
+    const error = code ? stderr.trim().split('\n').slice(-2).join(' ').slice(0, 300) || `exit ${code}` : undefined;
+    return { code, text: readRegular(answer), model: `${route.model} · ${route.effort}`, error };
+  } finally {
+    rmSync(answer, { force: true });
+  }
+}
+
+/** 감시가 도는 동안 맥이 잠들지 않게 (caffeinate -w: 감시가 죽으면 같이 끝난다). 설정을 끄면 다음 틱에 놓는다 */
+function keepAwakeController() {
+  let child = null;
+  let broken = false;
+  return (on) => {
+    if (process.platform !== 'darwin' || broken) return;
+    if (on && !child) {
+      const c = spawn('/usr/bin/caffeinate', ['-i', '-s', '-w', String(process.pid)], { stdio: 'ignore' });
+      child = c;
+      // 옛 caffeinate 의 종료가 새로 띄운 것을 지우지 않게 자기 것일 때만 비운다
+      c.on('error', () => {
+        broken = true; // caffeinate 가 없으면 매 틱 다시 띄우지 않는다
+        if (child === c) child = null;
+      });
+      c.on('exit', () => {
+        if (child === c) child = null;
+      });
+    } else if (!on && child) {
+      child.kill();
+      child = null;
+    }
+  };
+}
+
+async function watch(rest) {
+  const sub = rest[0] ?? 'status';
+  if (sub === 'run' || sub === 'once') {
+    const env = readDotEnv();
+    const dryRun = rest.includes('--dry-run');
+    const log = watchLogger(VAR, { echo: sub === 'once' || !!process.stdout.isTTY });
+    const release = dryRun ? () => {} : acquireWatchLock(VAR);
+    const baseEnv = { ...process.env };
+    // edgar 모듈(CIK·종목별 점검)은 User-Agent 를 process.env 에서 읽는다
+    if (env.EDGAR_UA && !process.env.EDGAR_UA) process.env.EDGAR_UA = env.EDGAR_UA;
+    const keepAwake = sub === 'run' ? keepAwakeController() : null;
+    const watcher = createWatcher({
+      root: WIKI, varDir: VAR, env, log, dryRun,
+      wiki: createWiki(join(WIKI, 'pages'), { root: WIKI }),
+      dart: createDart({ key: () => env.DART_API_KEY, cacheFile: join(REPO, 'var', 'dart-corps.json') }),
+      edgar: { recentFilings, cikOf },
+      notify: (msg) => push(msg, { env }),
+      interpret: dryRun ? null : (b) => interpretBatch(b, baseEnv),
+      keepAwake,
+      heartbeat: release.refresh,
+    });
+    try {
+      if (sub === 'once') {
+        await watcher.tick();
+        // 한 바퀴에서 걸린 공시를 60초 모으지 않고 바로 해석한다 — 점검·E2E 용
+        if (rest.includes('--interpret-now')) watcher.interpretNow();
+        await watcher.idle();
+        console.log(JSON.stringify({ sources: watcher.state.sources, targets: watcher.state.targets }, null, 2));
+        return;
+      }
+      const ac = new AbortController();
+      // 끄기 표시는 신호를 받은 순간 저장한다 — 한 바퀴가 길면 launchd 가 20초 뒤 강제 종료한다
+      for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => {
+        watcher.onSignal();
+        ac.abort();
+      });
+      await watcher.run({ signal: ac.signal });
+    } finally {
+      keepAwake?.(false);
+      release();
+    }
+  } else if (sub === 'install') {
+    requestStop(VAR); // 이미 돌고 있으면 다시 띄운다 — 사용자가 한 일이라 공백이 아니다
+    const r = installWatch({ wiki: WIKI, script: fileURLToPath(import.meta.url), repo: REPO, log: WATCH_LAUNCHD_LOG });
+    console.log(`✅ 상시 감시 등록 — 로그인 때 뜨고, 죽으면 다시 뜬다: ${r.plist}\n   로그: ${join(VAR, 'watch.log')}\n   상태: node bin/sss.mjs watch status`);
+  } else if (sub === 'uninstall') {
+    requestStop(VAR);
+    uninstallWatch();
+    console.log('✅ 상시 감시 해제');
+  } else if (sub === 'status') {
+    console.log(JSON.stringify({ ...watchStatus(VAR, { agent: watchAgentStatus() }), telegram: telegramStatus({ env: readDotEnv() }) }, null, 2));
+    const file = join(VAR, 'watch.log');
+    if (existsSync(file)) console.log(`최근 로그:\n${readFileSync(file, 'utf8').trim().split('\n').slice(-8).map((l) => `  ${l}`).join('\n')}`);
+  } else {
+    throw new Error(`알 수 없는 watch 명령: ${sub} (install | uninstall | status | run | once)`);
+  }
+}
+
+/** 텔레그램 연결 (대화 도구 telegram_link 의 예비 경로) — link 는 코드를 보여주고 봇이 받을 때까지 기다린다 */
+async function telegram(rest) {
+  const env = readDotEnv();
+  const sub = rest[0] ?? 'status';
+  if (sub === 'status') return console.log(JSON.stringify(telegramStatus({ env }), null, 2));
+  if (sub === 'unlink') return console.log(JSON.stringify(unlink()));
+  if (sub === 'test') {
+    const r = await push({ title: '🔔 sss 테스트', text: '알림이 여기로 온다.' }, { env });
+    if (r.via !== 'telegram') throw new Error(`텔레그램으로 못 보냄 (${r.via ?? '실패'}${r.error ? `: ${r.error}` : ''}) — node bin/sss.mjs telegram link`);
+    return console.log('✅ 보냄');
+  }
+  if (sub !== 'link') throw new Error(`알 수 없는 telegram 명령: ${sub} (link | test | unlink | status)`);
+  const tg = createTelegram({ token: env.TELEGRAM_BOT_TOKEN });
+  const s = await startLink({ tg });
+  console.log(`${s.next}\n  링크: ${s.link}\n  (10분 기다린다)`);
+  for (;;) {
+    await sleep(3000);
+    try {
+      const r = await confirmLink({ tg });
+      return console.log(`✅ 연결됨 · ${r.chat}`);
+    } catch (e) {
+      if (!/아직 받지 못했다/.test(e.message)) throw e;
+    }
   }
 }
 
@@ -550,7 +706,7 @@ async function briefingOrReport(rest) {
       } catch {}
     }
     // 규칙 파일 변조 같은 무결성 실패가 가장 알아야 할 실패다 — 파일을 못 남겨도 알림은 보낸다
-    if (valid) notify('sss 아침 브리핑 실패', e.message.slice(0, 120));
+    if (valid) await notify('⚠️ sss 아침 브리핑 실패', e.message.slice(0, 500));
     throw e;
   } finally {
     release?.();
@@ -563,6 +719,8 @@ if (import.meta.main) {
   else if (cmd === 'doctor') doctor();
   else if (cmd === 'briefing') orExit(() => briefingOrReport(rest));
   else if (cmd === 'schedule') orExit(() => schedule(rest));
+  else if (cmd === 'watch') orExit(() => watch(rest));
+  else if (cmd === 'telegram') orExit(() => telegram(rest));
   else if (cmd === 'exec') launch('exec', rest);
   else if (cmd === 'deep') launch('chat', rest, 'deep');
   else if (cmd === '-h' || cmd === '--help' || cmd === 'help') {

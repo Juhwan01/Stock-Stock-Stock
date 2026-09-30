@@ -170,6 +170,19 @@ test('공시 원문 — ZIP 을 풀어 텍스트로, 길면 자르고 표시한�
   assert.equal(r.source, 'https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260918800583');
 });
 
+test('방금 올라온 공시 — 원문 API 의 014(파일 없음)를 알아듣게 알리고, 감시는 열렸는지만 확인한다', async () => {
+  const notYet = Buffer.from('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><result><status>014</status><message>파일이 존재하지 않습니다.</message></result>');
+  let body = notYet;
+  const { dart } = dartWith({ 'document.xml': () => body });
+  await assert.rejects(dart.filingText('20260930800391'), /014 파일이 존재하지 않습니다\.? — 방금 올라온 공시는 원문이 API 에 늦게 열린다/);
+  assert.equal(await dart.documentReady('20260930800391'), false);
+  body = zip({ 'a.xml': DOC_XML });
+  assert.equal(await dart.documentReady('20260930800391'), true);
+  body = Buffer.from('<result><status>020</status><message>요청 제한</message></result>');
+  await assert.rejects(dart.documentReady('1'), /020/);
+  await assert.rejects(dart.filingText('1'), /DART 020 요청 제한/);
+});
+
 test('주요 계정 — 연결 기준을 고르고, 쉼표 숫자를 수로 바꾼다', async () => {
   const row = (fs, account, cur) => ({ fs_div: fs, sj_nm: '손익계산서', account_nm: account, thstrm_amount: cur, thstrm_dt: '2025.01.01 ~ 2025.12.31', frmtrm_amount: '-', frmtrm_dt: '', currency: 'KRW' });
   const { dart } = dartWith({
